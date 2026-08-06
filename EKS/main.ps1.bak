@@ -4,12 +4,15 @@
 Write-Host ">>> Initializing EKS Deployment with Permitted Instance Type (t3.medium)..." -ForegroundColor Cyan
 
 # -----------------------------------------------------------------------------
-# STEP 0: CLEAN UP LOCAL STATE
+# STEP 0: CLEAN UP LOCAL STATE & DUPLICATE FILES
 # -----------------------------------------------------------------------------
-Write-Host "`n[0/5] Purging local terraform state files..." -ForegroundColor Yellow
+Write-Host "`n[0/5] Purging local terraform state and duplicate files..." -ForegroundColor Yellow
 
 $OldErrorAction = $ErrorActionPreference
 $ErrorActionPreference = "SilentlyContinue"
+
+# Delete any duplicate backup files that break terraform init
+Get-ChildItem -Path $PWD -Filter "*Copy*.tf" | Remove-Item -Force -ErrorAction SilentlyContinue
 
 if (Test-Path "$PWD/terraform.tfstate") {
     Remove-Item "$PWD/terraform.tfstate" -Force -ErrorAction SilentlyContinue
@@ -213,7 +216,7 @@ resource "aws_eks_cluster" "main" {
   role_arn = aws_iam_role.cluster_role.arn
 
   vpc_config {
-    subnet_ids             = [aws_subnet.public_1.id, aws_subnet.public_2.id]
+    subnet_ids              = [aws_subnet.public_1.id, aws_subnet.public_2.id]
     endpoint_public_access = true
   }
 
@@ -311,7 +314,7 @@ resource "kubernetes_resource_quota" "lab_limits" {
 }
 
 # -----------------------------------------------------------------------------
-# AWS-AUTH CONFIGMAP (Correct resource type for new ConfigMap)
+# AWS-AUTH CONFIGMAP (Resource type for new ConfigMap)
 # -----------------------------------------------------------------------------
 resource "kubernetes_config_map_v1" "aws_auth" {
   metadata {
@@ -342,7 +345,7 @@ resource "kubernetes_cron_job_v1" "python_5m_cron" {
   }
 
   spec {
-    schedule                        = "*/5 * * * *"
+    schedule                       = "*/5 * * * *"
     successful_jobs_history_limit = 3
     failed_jobs_history_limit     = 1
 
@@ -361,8 +364,8 @@ resource "kubernetes_cron_job_v1" "python_5m_cron" {
             restart_policy = "OnFailure"
 
             container {
-              name    = "python-worker"
-              image   = "python:3.11-slim"
+              name  = "python-worker"
+              image = "python:3.11-slim"
               
               command = [
                 "python", "-u", "-c",
@@ -414,7 +417,7 @@ if ($LASTEXITCODE -ne 0) {
 # STEP 3: APPLY KUBERNETES MANIFESTS
 # -----------------------------------------------------------------------------
 Write-Host "`n[Stage 2/2] Applying Kubernetes Resources..." -ForegroundColor Yellow
-terraform apply -auto-approve
+& terraform apply -auto-approve
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "`nStage 2 Deployment failed." -ForegroundColor Red
@@ -429,9 +432,10 @@ Write-Host "`n[4/5] Updating Kubeconfig ($ClusterName)..." -ForegroundColor Yell
 aws eks update-kubeconfig --region us-east-1 --name $ClusterName
 
 # -----------------------------------------------------------------------------
-# STEP 5: VERIFICATION
+# STEP 5: VERIFICATION (With auto-cleanup of old test job)
 # -----------------------------------------------------------------------------
 Write-Host "`n[5/5] Triggering test job..." -ForegroundColor Yellow
+kubectl delete job instant-log-test-job -n compliant-apps --ignore-not-found=true
 kubectl create job --from=cronjob/python-5min-worker instant-log-test-job -n compliant-apps
 
 Write-Host "`nWaiting 15 seconds for pod initialization..." -ForegroundColor Yellow

@@ -4,10 +4,14 @@
 Write-Host ">>> Deploying Compliant ECS Fargate Task..." -ForegroundColor Cyan
 
 # -----------------------------------------------------------------------------
-# STEP 0: CLEAN UP LOCAL STATE
+# STEP 0: CLEAN UP LOCAL STATE & DUPLICATE FILES
 # -----------------------------------------------------------------------------
+Write-Host "`n[0/4] Purging local terraform state and duplicate files..." -ForegroundColor Yellow
+
 $OldErrorAction = $ErrorActionPreference
 $ErrorActionPreference = "SilentlyContinue"
+
+Get-ChildItem -Path $PWD -Filter "*Copy*.tf" | Remove-Item -Force -ErrorAction SilentlyContinue
 
 if (Test-Path "$PWD/terraform.tfstate") {
     Remove-Item "$PWD/terraform.tfstate" -Force -ErrorAction SilentlyContinue
@@ -31,6 +35,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
   }
 }
 
@@ -38,9 +46,33 @@ provider "aws" {
   region = "us-east-1"
 }
 
-# Dynamic retrieval of LabRole IAM Role ARN
-data "aws_iam_role" "lab_role" {
-  name = "LabRole"
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+# -----------------------------------------------------------------------------
+# IAM ROLE CREATION (Unique Name to avoid conflict)
+# -----------------------------------------------------------------------------
+resource "aws_iam_role" "ecs_execution_role" {
+  name = "ecsTaskRole-${random_id.suffix.hex}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
+  role       = aws_iam_role.ecs_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
 # -----------------------------------------------------------------------------
@@ -51,7 +83,7 @@ resource "aws_vpc" "main" {
   enable_dns_support   = true
   enable_dns_hostnames = true
 
-  tags = { Name = "ecs-cron-vpc" }
+  tags = { Name = "ecs-cron-vpc-${random_id.suffix.hex}" }
 }
 
 resource "aws_subnet" "public_1" {
@@ -85,7 +117,7 @@ resource "aws_route_table_association" "pub_1" {
 }
 
 resource "aws_security_group" "ecs_sg" {
-  name        = "ecs-cron-task-sg"
+  name        = "ecs-cron-task-sg-${random_id.suffix.hex}"
   description = "Allow outbound connectivity for scheduled task"
   vpc_id      = aws_vpc.main.id
 
@@ -98,28 +130,27 @@ resource "aws_security_group" "ecs_sg" {
 }
 
 # -----------------------------------------------------------------------------
-# CLOUDWATCH LOG GROUP
+# CLOUDWATCH LOG GROUP (Unique Name)
 # -----------------------------------------------------------------------------
 resource "aws_cloudwatch_log_group" "ecs_logs" {
-  name              = "/ecs/compliant-python-cron"
-  retention_in_days = 1
+  name = "/ecs/compliant-python-cron-${random_id.suffix.hex}"
 }
 
 # -----------------------------------------------------------------------------
-# ECS CLUSTER & TASK DEFINITION (Strictly within 2048 CPU & 4096 MB Limits)
+# ECS CLUSTER & TASK DEFINITION
 # -----------------------------------------------------------------------------
 resource "aws_ecs_cluster" "main" {
-  name = "compliant-cron-ecs-cluster"
+  name = "compliant-cron-ecs-cluster-${random_id.suffix.hex}"
 }
 
 resource "aws_ecs_task_definition" "python_cron" {
   family                   = "python-cron-task"
-  network_mode             = "awsvpc" # Permitted Network Mode
+  network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
-  cpu                      = "256"    # Limit: Max 2048
-  memory                   = "512"    # Limit: Max 4096
-  execution_role_arn       = data.aws_iam_role.lab_role.arn
-  task_role_arn            = data.aws_iam_role.lab_role.arn
+  cpu                      = "256"
+  memory                   = "512"
+  execution_role_arn       = aws_iam_role.ecs_execution_role.arn
+  task_role_arn            = aws_iam_role.ecs_execution_role.arn
 
   container_definitions = jsonencode([
     {
@@ -192,11 +223,12 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "`n[4/4] Checking ECS Task Status (Waiting 15s for task to spin up)..." -ForegroundColor Yellow
 Start-Sleep -Seconds 15
 
-$TaskArn = (aws ecs list-tasks --cluster compliant-cron-ecs-cluster --region us-east-1 --query "taskArns[0]" --output text)
+$ClusterName = (terraform output -raw cluster_name)
+$TaskArn = (aws ecs list-tasks --cluster $ClusterName --region us-east-1 --query "taskArns[0]" --output text)
 
 if ($TaskArn -and $TaskArn -ne "None") {
     Write-Host "Found Task ARN: $TaskArn" -ForegroundColor Green
-    aws ecs describe-tasks --cluster compliant-cron-ecs-cluster --tasks $TaskArn --region us-east-1 --query "tasks[0].{Status:lastStatus, DesiredStatus:desiredStatus, Health:healthStatus}"
+    aws ecs describe-tasks --cluster $ClusterName --tasks $TaskArn --region us-east-1 --query "tasks[0].{Status:lastStatus, DesiredStatus:desiredStatus, Health:healthStatus}"
 } else {
     Write-Host "Task initialization in progress..." -ForegroundColor Yellow
 }

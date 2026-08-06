@@ -4,10 +4,14 @@
 Write-Host ">>> Deploying Compliant ECS Fargate Task..." -ForegroundColor Cyan
 
 # -----------------------------------------------------------------------------
-# STEP 0: CLEAN UP LOCAL STATE
+# STEP 0: CLEAN UP LOCAL STATE & DUPLICATE FILES
 # -----------------------------------------------------------------------------
+Write-Host "`n[0/4] Purging local terraform state and duplicate files..." -ForegroundColor Yellow
+
 $OldErrorAction = $ErrorActionPreference
 $ErrorActionPreference = "SilentlyContinue"
+
+Get-ChildItem -Path $PWD -Filter "*Copy*.tf" | Remove-Item -Force -ErrorAction SilentlyContinue
 
 if (Test-Path "$PWD/terraform.tfstate") {
     Remove-Item "$PWD/terraform.tfstate" -Force -ErrorAction SilentlyContinue
@@ -38,9 +42,29 @@ provider "aws" {
   region = "us-east-1"
 }
 
-# Dynamic retrieval of LabRole IAM Role ARN
-data "aws_iam_role" "lab_role" {
-  name = "LabRole"
+# -----------------------------------------------------------------------------
+# IAM ROLE CREATION
+# -----------------------------------------------------------------------------
+resource "aws_iam_role" "ecs_execution_role" {
+  name = "ecsTaskExecutionRoleCustom"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
+  role       = aws_iam_role.ecs_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
 # -----------------------------------------------------------------------------
@@ -98,15 +122,14 @@ resource "aws_security_group" "ecs_sg" {
 }
 
 # -----------------------------------------------------------------------------
-# CLOUDWATCH LOG GROUP
+# CLOUDWATCH LOG GROUP (Retention removed due to IAM restriction)
 # -----------------------------------------------------------------------------
 resource "aws_cloudwatch_log_group" "ecs_logs" {
-  name              = "/ecs/compliant-python-cron"
-  retention_in_days = 1
+  name = "/ecs/compliant-python-cron"
 }
 
 # -----------------------------------------------------------------------------
-# ECS CLUSTER & TASK DEFINITION (Strictly within 2048 CPU & 4096 MB Limits)
+# ECS CLUSTER & TASK DEFINITION
 # -----------------------------------------------------------------------------
 resource "aws_ecs_cluster" "main" {
   name = "compliant-cron-ecs-cluster"
@@ -114,12 +137,12 @@ resource "aws_ecs_cluster" "main" {
 
 resource "aws_ecs_task_definition" "python_cron" {
   family                   = "python-cron-task"
-  network_mode             = "awsvpc" # Permitted Network Mode
+  network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
-  cpu                      = "256"    # Limit: Max 2048
-  memory                   = "512"    # Limit: Max 4096
-  execution_role_arn       = data.aws_iam_role.lab_role.arn
-  task_role_arn            = data.aws_iam_role.lab_role.arn
+  cpu                      = "256"
+  memory                   = "512"
+  execution_role_arn       = aws_iam_role.ecs_execution_role.arn
+  task_role_arn            = aws_iam_role.ecs_execution_role.arn
 
   container_definitions = jsonencode([
     {
