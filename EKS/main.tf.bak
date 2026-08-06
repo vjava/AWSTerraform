@@ -1,0 +1,341 @@
+terraform {
+  required_version = ">= 1.3.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.20"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+# -----------------------------------------------------------------------------
+# IAM ROLES & POLICIES
+# -----------------------------------------------------------------------------
+resource "aws_iam_role" "cluster_role" {
+  name = "eksClusterRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "eks.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "cluster_policy" {
+  role       = aws_iam_role.cluster_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+}
+
+resource "aws_iam_role" "node_role" {
+  name = "AmazonEKSNodeRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "node_worker" {
+  role       = aws_iam_role.node_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+}
+
+resource "aws_iam_role_policy_attachment" "node_cni" {
+  role       = aws_iam_role.node_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+}
+
+resource "aws_iam_role_policy_attachment" "node_registry" {
+  role       = aws_iam_role.node_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+resource "aws_iam_instance_profile" "node_profile" {
+  name = "eks-node-instance-profile"
+  role = aws_iam_role.node_role.name
+}
+
+# -----------------------------------------------------------------------------
+# VPC & NETWORKING
+# -----------------------------------------------------------------------------
+resource "aws_vpc" "eks_vpc" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = { Name = "eks-compliant-vpc" }
+}
+
+resource "aws_subnet" "public_1" {
+  vpc_id                  = aws_vpc.eks_vpc.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "us-east-1a"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name                                           = "eks-public-1"
+    "kubernetes.io/role/elb"                       = "1"
+    "kubernetes.io/cluster/compliant-eks-cluster" = "shared"
+  }
+}
+
+resource "aws_subnet" "public_2" {
+  vpc_id                  = aws_vpc.eks_vpc.id
+  cidr_block              = "10.0.2.0/24"
+  availability_zone       = "us-east-1b"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name                                           = "eks-public-2"
+    "kubernetes.io/role/elb"                       = "1"
+    "kubernetes.io/cluster/compliant-eks-cluster" = "shared"
+  }
+}
+
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.eks_vpc.id
+  tags   = { Name = "eks-igw" }
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.eks_vpc.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+
+  tags = { Name = "eks-public-rt" }
+}
+
+resource "aws_route_table_association" "pub_1" {
+  subnet_id      = aws_subnet.public_1.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "pub_2" {
+  subnet_id      = aws_subnet.public_2.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_security_group" "node_sg" {
+  name        = "eks-node-security-group"
+  description = "Security group for EKS worker nodes"
+  vpc_id      = aws_vpc.eks_vpc.id
+
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["10.0.0.0/16"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# -----------------------------------------------------------------------------
+# EKS CLUSTER
+# -----------------------------------------------------------------------------
+resource "aws_eks_cluster" "main" {
+  name     = "compliant-eks-cluster"
+  role_arn = aws_iam_role.cluster_role.arn
+
+  vpc_config {
+    subnet_ids             = [aws_subnet.public_1.id, aws_subnet.public_2.id]
+    endpoint_public_access = true
+  }
+
+  depends_on = [aws_iam_role_policy_attachment.cluster_policy]
+}
+
+# -----------------------------------------------------------------------------
+# WORKER NODES (Permitted Instance Type: t3.medium)
+# -----------------------------------------------------------------------------
+data "aws_ami" "eks_worker" {
+  filter {
+    name   = "name"
+    values = ["amazon-eks-node-1.28-v*"]
+  }
+  most_recent = true
+  owners      = ["602401143452"]
+}
+
+resource "aws_launch_template" "nodes" {
+  name_prefix   = "eks-nodes-"
+  image_id      = data.aws_ami.eks_worker.id
+  instance_type = "t3.medium"
+
+  iam_instance_profile {
+    arn = aws_iam_instance_profile.node_profile.arn
+  }
+
+  network_interfaces {
+    associate_public_ip_address = true
+    security_groups             = [aws_security_group.node_sg.id]
+  }
+
+  user_data = base64encode(<<-EOF
+              #!/bin/bash
+              /etc/eks/bootstrap.sh compliant-eks-cluster
+              EOF
+  )
+}
+
+resource "aws_autoscaling_group" "nodes" {
+  name                = "eks-self-managed-nodes"
+  vpc_zone_identifier = [aws_subnet.public_1.id, aws_subnet.public_2.id]
+  desired_capacity    = 1
+  max_size            = 2
+  min_size            = 1
+
+  launch_template {
+    id      = aws_launch_template.nodes.id
+    version = "$Latest"
+  }
+
+  tag {
+    key                 = "kubernetes.io/cluster/compliant-eks-cluster"
+    value               = "owned"
+    propagate_at_launch = true
+  }
+}
+
+# -----------------------------------------------------------------------------
+# KUBERNETES RESOURCES
+# -----------------------------------------------------------------------------
+data "aws_eks_cluster_auth" "main" {
+  name = aws_eks_cluster.main.name
+}
+
+provider "kubernetes" {
+  host                   = aws_eks_cluster.main.endpoint
+  cluster_ca_certificate = base64decode(aws_eks_cluster.main.certificate_authority[0].data)
+  token                  = data.aws_eks_cluster_auth.main.token
+}
+
+resource "kubernetes_namespace" "apps" {
+  metadata {
+    name = "compliant-apps"
+  }
+
+  depends_on = [aws_autoscaling_group.nodes]
+}
+
+resource "kubernetes_resource_quota" "lab_limits" {
+  metadata {
+    name      = "lab-resource-limits"
+    namespace = kubernetes_namespace.apps.metadata[0].name
+  }
+
+  spec {
+    hard = {
+      "pods"            = "3"
+      "requests.cpu"    = "300m"
+      "requests.memory" = "768Mi"
+      "limits.cpu"      = "750m"
+      "limits.memory"   = "1536Mi"
+    }
+  }
+}
+
+# -----------------------------------------------------------------------------
+# AWS-AUTH CONFIGMAP (Worker Nodes को क्लस्टर से जोड़ने के लिए आवश्यक)
+# -----------------------------------------------------------------------------
+resource "kubernetes_config_map_v1" "aws_auth" {
+  metadata {
+    name      = "aws-auth"
+    namespace = "kube-system"
+  }
+
+  data = {
+    mapRoles = jsonencode([
+      {
+        rolearn  = aws_iam_role.node_role.arn
+        username = "system:node:{{EC2PrivateDNSName}}"
+        groups   = [
+          "system:bootstrappers",
+          "system:nodes"
+        ]
+      }
+    ])
+  }
+
+  depends_on = [aws_eks_cluster.main]
+}
+
+resource "kubernetes_cron_job_v1" "python_5m_cron" {
+  metadata {
+    name      = "python-5min-worker"
+    namespace = kubernetes_namespace.apps.metadata[0].name
+  }
+
+  spec {
+    schedule                        = "*/5 * * * *"
+    successful_jobs_history_limit = 3
+    failed_jobs_history_limit     = 1
+
+    job_template {
+      metadata {
+        labels = { app = "python-cron" }
+      }
+
+      spec {
+        template {
+          metadata {
+            labels = { app = "python-cron" }
+          }
+
+          spec {
+            restart_policy = "OnFailure"
+
+            container {
+              name    = "python-worker"
+              image   = "python:3.11-slim"
+              
+              command = [
+                "python", "-u", "-c",
+                "import datetime; print(f'[{datetime.datetime.now()}] SUCCESS: 5-minute scheduled Python task executed in EKS!')"
+              ]
+
+              resources {
+                requests = {
+                  cpu    = "100m"
+                  memory = "256Mi"
+                }
+                limits = {
+                  cpu    = "200m"
+                  memory = "512Mi"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [kubernetes_resource_quota.lab_limits, kubernetes_config_map_v1.aws_auth]
+}
+
+output "cluster_name" { value = aws_eks_cluster.main.name }
+output "cluster_endpoint" { value = aws_eks_cluster.main.endpoint }
