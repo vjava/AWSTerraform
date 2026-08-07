@@ -1,0 +1,383 @@
+# ==============================================================================
+# AWS API GATEWAY (REST, HTTP, WEBSOCKET, THROTTLING, CACHING, VPC LINK)
+# ==============================================================================
+Write-Host ">>> Initializing AWS API Gateway Infrastructure and Verification Pipeline..." -ForegroundColor Cyan
+
+# -----------------------------------------------------------------------------
+# STEP 0: PURGE PREVIOUS LOCAL STATE & OLD TERRAFORM FILES
+# -----------------------------------------------------------------------------
+Write-Host "`n[0/4] Purging previous terraform state and temporary files..." -ForegroundColor Yellow
+
+$OldErrorAction = $ErrorActionPreference
+$ErrorActionPreference = "SilentlyContinue"
+
+Get-ChildItem -Path $PWD -Filter "*.tf" | Remove-Item -Force -ErrorAction SilentlyContinue
+
+if (Test-Path "$PWD/terraform.tfstate") {
+    Remove-Item "$PWD/terraform.tfstate" -Force -ErrorAction SilentlyContinue
+}
+if (Test-Path "$PWD/terraform.tfstate.backup") {
+    Remove-Item "$PWD/terraform.tfstate.backup" -Force -ErrorAction SilentlyContinue
+}
+if (Test-Path "$PWD/.terraform") {
+    Remove-Item "$PWD/.terraform" -Recurse -Force -ErrorAction SilentlyContinue
+}
+if (Test-Path "$PWD/.terraform.lock.hcl") {
+    Remove-Item "$PWD/.terraform.lock.hcl" -Force -ErrorAction SilentlyContinue
+}
+if (Test-Path "$PWD/verify_apigateway.py") {
+    Remove-Item "$PWD/verify_apigateway.py" -Force -ErrorAction SilentlyContinue
+}
+
+$ErrorActionPreference = $OldErrorAction
+Write-Host "Local workspace cleaned." -ForegroundColor Green
+
+# -----------------------------------------------------------------------------
+# STEP 1: GENERATE TERRAFORM CODE (main.tf)
+# -----------------------------------------------------------------------------
+Write-Host "`n[1/4] Writing API Gateway Terraform configuration..." -ForegroundColor Yellow
+
+$TerraformCode = @'
+terraform {
+  required_version = ">= 1.3.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+data "aws_caller_identity" "current" {}
+
+# -----------------------------------------------------------------------------
+# 1. VPC LINK FOR API GATEWAY
+# -----------------------------------------------------------------------------
+resource "aws_vpc" "main_vpc" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  tags = { Name = "apigw-vpc-${random_id.suffix.hex}" }
+}
+
+resource "aws_subnet" "public_subnet" {
+  vpc_id            = aws_vpc.main_vpc.id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = "us-east-1a"
+}
+
+resource "aws_lb" "nlb" {
+  name               = "apigw-nlb-${random_id.suffix.hex}"
+  internal           = true
+  load_balancer_type = "network"
+  subnets            = [aws_subnet.public_subnet.id]
+}
+
+resource "aws_api_gateway_vpc_link" "vpc_link" {
+  name        = "apigw-vpc-link-${random_id.suffix.hex}"
+  target_arns = [aws_lb.nlb.arn]
+}
+
+# -----------------------------------------------------------------------------
+# 2. REST API (WITH CACHING, THROTTLING, & API KEY AUTH)
+# -----------------------------------------------------------------------------
+resource "aws_api_gateway_rest_api" "rest_api" {
+  name        = "compliant-rest-api-${random_id.suffix.hex}"
+  description = "REST API with Throttling and Caching"
+
+  endpoint_configuration {
+    types = ["REGIONAL"]
+  }
+}
+
+resource "aws_api_gateway_resource" "resource" {
+  rest_api_id = aws_api_gateway_rest_api.rest_api.id
+  parent_id   = aws_api_gateway_rest_api.rest_api.root_resource_id
+  path_part   = "demo"
+}
+
+resource "aws_api_gateway_method" "method" {
+  rest_api_id      = aws_api_gateway_rest_api.rest_api.id
+  resource_id      = aws_api_gateway_resource.resource.id
+  http_method      = "GET"
+  authorization    = "NONE"
+  api_key_required = true
+}
+
+resource "aws_api_gateway_integration" "integration" {
+  rest_api_id = aws_api_gateway_rest_api.rest_api.id
+  resource_id = aws_api_gateway_resource.resource.id
+  http_method = aws_api_gateway_method.method.http_method
+  type        = "MOCK"
+
+  request_templates = {
+    "application/json" = "{\"statusCode\": 200}"
+  }
+}
+
+resource "aws_api_gateway_method_response" "response_200" {
+  rest_api_id = aws_api_gateway_rest_api.rest_api.id
+  resource_id = aws_api_gateway_resource.resource.id
+  http_method = aws_api_gateway_method.method.http_method
+  status_code = "200"
+}
+
+resource "aws_api_gateway_integration_response" "integration_response" {
+  rest_api_id = aws_api_gateway_rest_api.rest_api.id
+  resource_id = aws_api_gateway_resource.resource.id
+  http_method = aws_api_gateway_method.method.http_method
+  status_code = aws_api_gateway_method_response.response_200.status_code
+
+  response_templates = {
+    "application/json" = "{\"message\": \"Success from REST API Mock Target\"}"
+  }
+
+  depends_on = [aws_api_gateway_integration.integration]
+}
+
+resource "aws_api_gateway_deployment" "rest_deployment" {
+  rest_api_id = aws_api_gateway_rest_api.rest_api.id
+
+  depends_on = [aws_api_gateway_integration_response.integration_response]
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_api_gateway_stage" "rest_stage" {
+  deployment_id = aws_api_gateway_deployment.rest_deployment.id
+  rest_api_id   = aws_api_gateway_rest_api.rest_api.id
+  stage_name    = "prod"
+
+  cache_cluster_enabled = true
+  cache_cluster_size    = "0.5"
+}
+
+resource "aws_api_gateway_method_settings" "rest_settings" {
+  rest_api_id = aws_api_gateway_rest_api.rest_api.id
+  stage_name  = aws_api_gateway_stage.rest_stage.stage_name
+  method_path = "*/*"
+
+  settings {
+    throttling_burst_limit = 100
+    throttling_rate_limit  = 50
+    caching_enabled        = true
+  }
+}
+
+# API Key and Usage Plan (Basic Auth & Rate Limiting)
+resource "aws_api_gateway_api_key" "api_key" {
+  name = "compliant-key-${random_id.suffix.hex}"
+}
+
+resource "aws_api_gateway_usage_plan" "usage_plan" {
+  name = "compliant-usage-plan-${random_id.suffix.hex}"
+
+  api_stages {
+    api_id = aws_api_gateway_rest_api.rest_api.id
+    stage  = aws_api_gateway_stage.rest_stage.stage_name
+  }
+
+  throttle_settings {
+    burst_limit = 100
+    rate_limit  = 50
+  }
+}
+
+resource "aws_api_gateway_usage_plan_key" "usage_plan_key" {
+  key_id        = aws_api_gateway_api_key.api_key.id
+  key_type      = "API_KEY"
+  usage_plan_id = aws_api_gateway_usage_plan.usage_plan.id
+}
+
+# -----------------------------------------------------------------------------
+# 3. HTTP API (API GATEWAY V2)
+# -----------------------------------------------------------------------------
+resource "aws_apigatewayv2_api" "http_api" {
+  name          = "compliant-http-api-${random_id.suffix.hex}"
+  protocol_type = "HTTP"
+}
+
+resource "aws_apigatewayv2_stage" "http_stage" {
+  api_id      = aws_apigatewayv2_api.http_api.id
+  name        = "prod"
+  auto_deploy = true
+
+  default_route_settings {
+    throttling_burst_limit = 100
+    throttling_rate_limit  = 50
+  }
+}
+
+# -----------------------------------------------------------------------------
+# 4. WEBSOCKET API (API GATEWAY V2)
+# -----------------------------------------------------------------------------
+resource "aws_apigatewayv2_api" "websocket_api" {
+  name                       = "compliant-websocket-api-${random_id.suffix.hex}"
+  protocol_type              = "WEBSOCKET"
+  route_selection_expression = "$request.body.action"
+}
+
+resource "aws_apigatewayv2_route" "ws_connect_route" {
+  api_id    = aws_apigatewayv2_api.websocket_api.id
+  route_key = "$connect"
+}
+
+resource "aws_apigatewayv2_route" "ws_disconnect_route" {
+  api_id    = aws_apigatewayv2_api.websocket_api.id
+  route_key = "$disconnect"
+}
+
+resource "aws_apigatewayv2_route" "ws_default_route" {
+  api_id    = aws_apigatewayv2_api.websocket_api.id
+  route_key = "$default"
+}
+
+resource "aws_apigatewayv2_stage" "ws_stage" {
+  api_id      = aws_apigatewayv2_api.websocket_api.id
+  name        = "prod"
+  auto_deploy = true
+}
+
+# OUTPUTS
+output "rest_api_id" {
+  value = aws_api_gateway_rest_api.rest_api.id
+}
+
+output "rest_api_url" {
+  value = aws_api_gateway_stage.rest_stage.invoke_url
+}
+
+output "http_api_id" {
+  value = aws_apigatewayv2_api.http_api.id
+}
+
+output "websocket_api_id" {
+  value = aws_apigatewayv2_api.websocket_api.id
+}
+
+output "vpc_link_id" {
+  value = aws_api_gateway_vpc_link.vpc_link.id
+}
+
+output "api_key_value" {
+  value     = aws_api_gateway_api_key.api_key.value
+  sensitive = true
+}
+'@
+
+$MainTfPath = Join-Path -Path $PWD -ChildPath "main.tf"
+[System.IO.File]::WriteAllText($MainTfPath, $TerraformCode)
+Write-Host "main.tf generated successfully." -ForegroundColor Green
+
+# -----------------------------------------------------------------------------
+# STEP 2: APPLY TERRAFORM DEPLOYMENT
+# -----------------------------------------------------------------------------
+Write-Host "`n[2/4] Initializing and Applying Terraform Configuration..." -ForegroundColor Yellow
+terraform init -reconfigure
+
+& terraform apply -auto-approve
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "`nTerraform deployment failed!" -ForegroundColor Red
+    exit 1
+}
+
+# -----------------------------------------------------------------------------
+# STEP 3: EXTRACT OUTPUTS AND PREPARE PYTHON CLIENT
+# -----------------------------------------------------------------------------
+Write-Host "`n[3/4] Extracting Details and Running Python Verification Client..." -ForegroundColor Yellow
+$REST_API_ID   = (terraform output -raw rest_api_id)
+$REST_API_URL  = (terraform output -raw rest_api_url)
+$HTTP_API_ID   = (terraform output -raw http_api_id)
+$WS_API_ID     = (terraform output -raw websocket_api_id)
+$VPC_LINK_ID   = (terraform output -raw vpc_link_id)
+
+Write-Host "REST API ID:      $REST_API_ID" -ForegroundColor Green
+Write-Host "REST API Invoke:  $REST_API_URL" -ForegroundColor Green
+Write-Host "HTTP API ID:      $HTTP_API_ID" -ForegroundColor Green
+Write-Host "WebSocket API ID: $WS_API_ID" -ForegroundColor Green
+Write-Host "VPC Link ID:      $VPC_LINK_ID" -ForegroundColor Green
+
+python -c "import boto3" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Installing boto3..." -ForegroundColor Yellow
+    pip install boto3
+}
+
+$PythonScript = @"
+import boto3
+import json
+
+region = 'us-east-1'
+rest_api_id = '$REST_API_ID'
+http_api_id = '$HTTP_API_ID'
+ws_api_id = '$WS_API_ID'
+vpc_link_id = '$VPC_LINK_ID'
+
+apigw_v1 = boto3.client('apigateway', region_name=region)
+apigw_v2 = boto3.client('apigatewayv2', region_name=region)
+
+print("\n" + "="*70)
+print("VERIFYING API GATEWAY CONFIGURATIONS")
+print("="*70)
+
+try:
+    # 1. Verify REST API & Stage Settings (Caching & Throttling)
+    rest_api = apigw_v1.get_rest_api(restApiId=rest_api_id)
+    print(f"REST API Name:            {rest_api.get('name')}")
+    
+    stage_info = apigw_v1.get_stage(restApiId=rest_api_id, stageName='prod')
+    print(f"Cache Cluster Enabled:    {stage_info.get('cacheClusterEnabled')}")
+    print(f"Cache Cluster Size:       {stage_info.get('cacheClusterSize')}")
+
+    # Method Throttling Settings
+    method_settings = stage_info.get('methodSettings', {}).get('*/*', {})
+    print(f"Rest Rate Limit:          {method_settings.get('throttlingRateLimit')}")
+    print(f"Rest Burst Limit:         {method_settings.get('throttlingBurstLimit')}")
+    print("-" * 70)
+
+    # 2. Verify HTTP API
+    http_api = apigw_v2.get_api(ApiId=http_api_id)
+    print(f"HTTP API Name:            {http_api.get('Name')}")
+    print(f"Protocol Type:            {http_api.get('ProtocolType')}")
+    print("-" * 70)
+
+    # 3. Verify WebSocket API
+    ws_api = apigw_v2.get_api(ApiId=ws_api_id)
+    print(f"WebSocket API Name:       {ws_api.get('Name')}")
+    print(f"Protocol Type:            {ws_api.get('ProtocolType')}")
+    print(f"Route Selection Expr:     {ws_api.get('RouteSelectionExpression')}")
+    print("-" * 70)
+
+    # 4. Verify VPC Link
+    vpc_link = apigw_v1.get_vpc_link(vpcLinkId=vpc_link_id)
+    print(f"VPC Link ID:              {vpc_link.get('id')}")
+    print(f"VPC Link Status:          {vpc_link.get('status')}")
+    print("="*70)
+
+    print("\nAPI Gateway Verification Completed Successfully!")
+
+except Exception as e:
+    print(f"Error during verification: {e}")
+"@
+
+$VerifyScriptPath = Join-Path -Path $PWD -ChildPath "verify_apigateway.py"
+[System.IO.File]::WriteAllText($VerifyScriptPath, $PythonScript)
+python verify_apigateway.py
+
+Write-Host "`n==================================================" -ForegroundColor Cyan
+Write-Host "AWS API GATEWAY PIPELINE DEPLOYED & VERIFIED!" -ForegroundColor Green
+Write-Host "==================================================" -ForegroundColor Cyan

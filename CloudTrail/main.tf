@@ -28,13 +28,15 @@ resource "aws_s3_bucket" "cloudtrail_bucket" {
   force_destroy = false  # Deletion Of CloudTrail Logs Not Allowed
 }
 
-# Standard Retention Policy & Log Protection
+# Standard Retention Policy & Log Protection (Filter added for provider compliance)
 resource "aws_s3_bucket_lifecycle_configuration" "bucket_lifecycle" {
   bucket = aws_s3_bucket.cloudtrail_bucket.id
 
   rule {
     id     = "standard-retention-rule"
     status = "Enabled"
+
+    filter {}
 
     transition {
       days          = 90
@@ -73,7 +75,7 @@ resource "aws_s3_bucket_policy" "cloudtrail_bucket_policy" {
   })
 }
 
-# 2. AWS CLOUDTRAIL TRAIL
+# 2. AWS CLOUDTRAIL TRAIL (Removed insight_selector to bypass PutInsightSelectors SCP restriction)
 resource "aws_cloudtrail" "compliant_trail" {
   name                          = "compliant-standard-trail-${random_id.suffix.hex}"
   s3_bucket_name                = aws_s3_bucket.cloudtrail_bucket.id
@@ -81,10 +83,6 @@ resource "aws_cloudtrail" "compliant_trail" {
   include_global_service_events = true
   is_multi_region_trail         = true
   enable_log_file_validation    = true  # Log Validation Enabled
-
-  insight_selector {
-    insight_type = "ApiCallRateInsight"  # Basic Insights
-  }
 
   event_selector {
     read_write_type           = "All"

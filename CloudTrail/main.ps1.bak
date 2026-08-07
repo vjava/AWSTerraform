@@ -1,5 +1,5 @@
 # ==============================================================================
-# AWS CLOUDTRAIL (LOG VALIDATION, COMPLIANT RETENTION) + PYTHON VERIFICATION
+# AWS CLOUDTRAIL (LOG VALIDATION, INSIGHTS, COMPLIANT RETENTION) + PYTHON VERIFICATION
 # ==============================================================================
 Write-Host ">>> Initializing AWS CloudTrail Infrastructure and Verification Pipeline..." -ForegroundColor Cyan
 
@@ -65,15 +65,13 @@ resource "aws_s3_bucket" "cloudtrail_bucket" {
   force_destroy = false  # Deletion Of CloudTrail Logs Not Allowed
 }
 
-# Standard Retention Policy & Log Protection (Filter added for provider compliance)
+# Standard Retention Policy & Log Protection
 resource "aws_s3_bucket_lifecycle_configuration" "bucket_lifecycle" {
   bucket = aws_s3_bucket.cloudtrail_bucket.id
 
   rule {
     id     = "standard-retention-rule"
     status = "Enabled"
-
-    filter {}
 
     transition {
       days          = 90
@@ -112,7 +110,7 @@ resource "aws_s3_bucket_policy" "cloudtrail_bucket_policy" {
   })
 }
 
-# 2. AWS CLOUDTRAIL TRAIL (Removed insight_selector to bypass PutInsightSelectors SCP restriction)
+# 2. AWS CLOUDTRAIL TRAIL
 resource "aws_cloudtrail" "compliant_trail" {
   name                          = "compliant-standard-trail-${random_id.suffix.hex}"
   s3_bucket_name                = aws_s3_bucket.cloudtrail_bucket.id
@@ -120,6 +118,10 @@ resource "aws_cloudtrail" "compliant_trail" {
   include_global_service_events = true
   is_multi_region_trail         = true
   enable_log_file_validation    = true  # Log Validation Enabled
+
+  insight_selector {
+    insight_type = "ApiCallRateInsight"  # Basic Insights
+  }
 
   event_selector {
     read_write_type           = "All"
@@ -210,7 +212,13 @@ try:
     print(f"\nIs Logging Active:           {status_info.get('IsLogging')}")
     print(f"Latest Delivery Time:        {status_info.get('LatestDeliveryTime', 'Pending initial delivery')}")
 
-    # 3. Fetch Standard Management Events
+    # 3. Check Insights Configuration
+    insights = ct_client.get_insight_selectors(TrailName=trail_name)
+    print("\nInsight Selectors Configured:")
+    for selector in insights.get('InsightSelectors', []):
+        print(f" - Insight Type: {selector.get('InsightType')}")
+
+    # 4. Fetch Standard Management Events
     print("\nFetching Recent Standard Management Events (LookupEvents)...")
     events_response = ct_client.lookup_events(MaxResults=5)
     print("-" * 70)
