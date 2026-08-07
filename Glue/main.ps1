@@ -1,0 +1,265 @@
+# ==============================================================================
+# AWS GLUE TERRAFORM PROVISIONER & PYTHON INVOCATION CLIENT (LAB COMPLIANT)
+# Embeds Terraform HCL using Managed Policies to bypass lab permission errors.
+# ==============================================================================
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function Write-OpLog {
+    param (
+        [string]$Step,
+        [string]$Operation,
+        [string]$Details,
+        [string]$Status = "INFO"
+    )
+    $TimeStamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $Color = switch ($Status) {
+        "SUCCESS" { "Green" }
+        "WARN"    { "Yellow" }
+        "ERROR"   { "Red" }
+        default   { "Cyan" }
+    }
+    Write-Host "[$TimeStamp] [$Step] [$Operation] $Details" -ForegroundColor $Color
+}
+
+# 1. Prerequisite Checks
+if (-not (Get-Command "terraform" -ErrorAction SilentlyContinue)) {
+    Write-Error "Terraform executable not found in PATH."
+    exit
+}
+
+if (-not (Get-Command "python" -ErrorAction SilentlyContinue)) {
+    Write-Error "Python executable not found in PATH."
+    exit
+}
+
+# 2. Workspace Setup
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Get-Location }
+$WorkDir = Join-Path $ScriptDir "tf_glue_lab"
+
+if (-not (Test-Path $WorkDir)) {
+    New-Item -ItemType Directory -Path $WorkDir | Out-Null
+}
+
+$TfFilePath = Join-Path $WorkDir "main.tf"
+$PythonClientPath = Join-Path $WorkDir "invoke_glue.py"
+
+Write-Host "`n================================================================================" -ForegroundColor White
+Write-Host " STARTING AWS GLUE TERRAFORM PROVISIONING & PYTHON INVOCATION " -ForegroundColor Green
+Write-Host " Workspace Path    : $WorkDir" -ForegroundColor Cyan
+Write-Host " Lab Compliant     : Uses Managed AWS Policies (bypasses iam:PutRolePolicy)" -ForegroundColor Cyan
+Write-Host "================================================================================" -ForegroundColor White
+
+
+# ------------------------------------------------------------------------------
+# STEP 1: GENERATE TERRAFORM HCL (Lab Environment Friendly)
+# ------------------------------------------------------------------------------
+Write-OpLog -Step "Step 1" -Operation "Generate HCL" -Details "Writing Terraform code to $TfFilePath..."
+
+$TerraformHcl = @'
+terraform {
+  required_version = ">= 1.0.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+# 1. S3 Bucket for Glue Scripts & Temporary Files
+resource "aws_s3_bucket" "glue_bucket" {
+  bucket        = "aws-glue-script-bucket-${random_id.suffix.hex}"
+  force_destroy = true
+}
+
+# 2. Upload Minimal PySpark Script to S3
+resource "aws_s3_object" "glue_script" {
+  bucket  = aws_s3_bucket.glue_bucket.id
+  key     = "scripts/sample_glue_job.py"
+  content = <<EOF
+import sys
+from awsglue.utils import getResolvedOptions
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+print(f"Hello from AWS Glue Job: {args['JOB_NAME']}")
+print("Execution Completed Successfully.")
+EOF
+}
+
+# 3. IAM Role for Glue Service
+resource "aws_iam_role" "glue_role" {
+  name = "aws_glue_minimal_role_${random_id.suffix.hex}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "glue.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# Managed Attachments (Compatible with AWS Lab Roles & Permissions)
+resource "aws_iam_role_policy_attachment" "glue_service_attachment" {
+  role       = aws_iam_role.glue_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+}
+
+resource "aws_iam_role_policy_attachment" "glue_s3_attachment" {
+  role       = aws_iam_role.glue_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+}
+
+# 4. AWS Glue Job (Lowest Resource Configuration)
+resource "aws_glue_job" "minimal_job" {
+  name              = "minimal-pyspark-job-${random_id.suffix.hex}"
+  role_arn          = aws_iam_role.glue_role.arn
+  glue_version      = "4.0"
+  worker_type       = "G.1X"
+  number_of_workers = 2
+  timeout           = 5
+  max_retries       = 0
+
+  command {
+    name            = "glueetl"
+    script_location = "s3://${aws_s3_bucket.glue_bucket.id}/${aws_s3_object.glue_script.key}"
+    python_version  = "3"
+  }
+
+  default_arguments = {
+    "--job-language"                    = "python"
+    "--enable-continuous-cloudwatch-log" = "true"
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.glue_service_attachment,
+    aws_iam_role_policy_attachment.glue_s3_attachment
+  ]
+}
+
+# OUTPUTS
+output "glue_job_name" {
+  value       = aws_glue_job.minimal_job.name
+  description = "Name of the provisioned Glue Job"
+}
+
+output "aws_region" {
+  value       = "us-east-1"
+  description = "AWS Region where resources are deployed"
+}
+'@
+
+Set-Content -Path $TfFilePath -Value $TerraformHcl -Encoding UTF8
+Write-OpLog -Step "Step 1" -Operation "Generate HCL" -Details "Terraform configuration written." -Status "SUCCESS"
+
+
+# ------------------------------------------------------------------------------
+# STEP 2: GENERATE PYTHON BOTO3 CLIENT INVOCATION SCRIPT
+# ------------------------------------------------------------------------------
+Write-OpLog -Step "Step 2" -Operation "Generate Python" -Details "Writing Python Boto3 client to $PythonClientPath..."
+
+$PythonScript = @'
+import boto3
+import sys
+import time
+
+def invoke_and_monitor_glue_job(job_name, region_name="us-east-1"):
+    print(f"\n[Python Client] Initializing AWS Glue client for region '{region_name}'...")
+    client = boto3.client('glue', region_name=region_name)
+
+    try:
+        # 1. Trigger the Glue Job
+        print(f"[Python Client] Starting execution for Glue Job: '{job_name}'...")
+        response = client.start_job_run(JobName=job_name)
+        job_run_id = response['JobRunId']
+        print(f"[Python Client] Job Run Triggered Successfully. JobRunId: {job_run_id}")
+
+        # 2. Poll for Execution Completion
+        print("[Python Client] Polling job status...")
+        while True:
+            status_response = client.get_job_run(JobName=job_name, RunId=job_run_id)
+            job_state = status_response['JobRun']['JobRunState']
+            print(f"   -> Current State: {job_state}")
+
+            if job_state in ['SUCCEEDED', 'FAILED', 'STOPPED', 'TIMEOUT']:
+                break
+            time.sleep(10)
+
+        if job_state == 'SUCCEEDED':
+            execution_time = status_response['JobRun'].get('ExecutionTime', 0)
+            print(f"\n[SUCCESS] Glue Job completed in {execution_time} seconds!")
+        else:
+            error_message = status_response['JobRun'].get('ErrorMessage', 'Unknown error')
+            print(f"\n[ERROR] Glue Job ended with state: {job_state}. Reason: {error_message}")
+            sys.exit(1)
+
+    except Exception as e:
+        print(f"\n[Python Exception]: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python invoke_glue.py <glue_job_name> [region_name]")
+        sys.exit(1)
+
+    job_name_arg = sys.argv[1]
+    region_arg = sys.argv[2] if len(sys.argv) > 2 else "us-east-1"
+    invoke_and_monitor_glue_job(job_name_arg, region_arg)
+'@
+
+Set-Content -Path $PythonClientPath -Value $PythonScript -Encoding UTF8
+Write-OpLog -Step "Step 2" -Operation "Generate Python" -Details "Python script generated." -Status "SUCCESS"
+
+
+# ------------------------------------------------------------------------------
+# STEP 3: EXECUTE TERRAFORM & INVOKE VIA PYTHON
+# ------------------------------------------------------------------------------
+Push-Location $WorkDir
+
+try {
+    Write-OpLog -Step "Step 3" -Operation "terraform init" -Details "Downloading providers..."
+    terraform init -input=false -no-color | Out-Null
+
+    Write-OpLog -Step "Step 3" -Operation "terraform apply" -Details "Provisioning Glue resources via Terraform..."
+    terraform apply -auto-approve -input=false -no-color | Out-Null
+
+    # Extract Outputs
+    $GlueJobName = (terraform output -raw glue_job_name 2>$null).Trim()
+    $AwsRegion   = (terraform output -raw aws_region 2>$null).Trim()
+
+    Write-Host "`n================================================================================" -ForegroundColor White
+    Write-Host " PROVISIONING COMPLETE " -ForegroundColor Green
+    Write-Host " Glue Job Name : $GlueJobName" -ForegroundColor Cyan
+    Write-Host " AWS Region    : $AwsRegion" -ForegroundColor Cyan
+    Write-Host "================================================================================" -ForegroundColor White
+
+    # Run Python Client to Invoke Glue Job
+    Write-OpLog -Step "Step 4" -Operation "Python Invocation" -Details "Calling Python Boto3 client to trigger '$GlueJobName'..."
+    python $PythonClientPath "$GlueJobName" "$AwsRegion"
+
+}
+catch {
+    Write-OpLog -Step "Error" -Operation "Execution Failure" -Details "Error: $_" -Status "ERROR"
+}
+finally {
+    Pop-Location
+}
