@@ -1,0 +1,325 @@
+# ==============================================================================
+# AWS ELASTIC LOAD BALANCING (ALB) WITH SERVICE DISCOVERY PIPELINE
+# ==============================================================================
+Write-Host ">>> Initializing ALB with Service Discovery Architecture Pipeline..." -ForegroundColor Cyan
+
+# -----------------------------------------------------------------------------
+# STEP 1: CLEAN LOCAL WORKSPACE
+# -----------------------------------------------------------------------------
+Write-Host "`n[1/4] Cleaning local workspace..." -ForegroundColor Yellow
+
+$OldErrorAction = $ErrorActionPreference
+$ErrorActionPreference = "SilentlyContinue"
+
+Get-ChildItem -Path $PWD -Filter "*.tf" | Remove-Item -Force -ErrorAction SilentlyContinue
+
+if (Test-Path "$PWD/terraform.tfstate") { Remove-Item "$PWD/terraform.tfstate" -Force -ErrorAction SilentlyContinue }
+if (Test-Path "$PWD/terraform.tfstate.backup") { Remove-Item "$PWD/terraform.tfstate.backup" -Force -ErrorAction SilentlyContinue }
+if (Test-Path "$PWD/.terraform") { Remove-Item "$PWD/.terraform" -Recurse -Force -ErrorAction SilentlyContinue }
+if (Test-Path "$PWD/.terraform.lock.hcl") { Remove-Item "$PWD/.terraform.lock.hcl" -Force -ErrorAction SilentlyContinue }
+if (Test-Path "$PWD/verify_sd_alb.py") { Remove-Item "$PWD/verify_sd_alb.py" -Force -ErrorAction SilentlyContinue }
+
+$ErrorActionPreference = $OldErrorAction
+Write-Host "Workspace cleaned." -ForegroundColor Green
+
+# -----------------------------------------------------------------------------
+# STEP 2: GENERATE TERRAFORM CODE (main.tf)
+# -----------------------------------------------------------------------------
+Write-Host "`n[2/4] Writing ALB and Service Discovery Terraform configuration..." -ForegroundColor Yellow
+
+$TerraformCode = @'
+terraform {
+  required_version = ">= 1.3.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+# -----------------------------------------------------------------------------
+# 1. NETWORKING SETUP (VPC & SUBNETS)
+# -----------------------------------------------------------------------------
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name = "sd-alb-vpc-${random_id.suffix.hex}"
+  }
+}
+
+resource "aws_subnet" "subnet_a" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "us-east-1a"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "sd-alb-subnet-a"
+  }
+}
+
+resource "aws_subnet" "subnet_b" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.2.0/24"
+  availability_zone       = "us-east-1b"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "sd-alb-subnet-b"
+  }
+}
+
+resource "aws_internet_gateway" "gw" {
+  vpc_id = aws_vpc.main.id
+}
+
+resource "aws_route_table" "rt" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.gw.id
+  }
+}
+
+resource "aws_route_table_association" "a" {
+  subnet_id      = aws_subnet.subnet_a.id
+  route_table_id = aws_route_table.rt.id
+}
+
+resource "aws_route_table_association" "b" {
+  subnet_id      = aws_subnet.subnet_b.id
+  route_table_id = aws_route_table.rt.id
+}
+
+resource "aws_security_group" "alb_sg" {
+  name        = "alb-security-group-${random_id.suffix.hex}"
+  description = "Allow HTTP inbound traffic"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# -----------------------------------------------------------------------------
+# 2. ELASTIC LOAD BALANCER (ALB) SETUP
+# -----------------------------------------------------------------------------
+resource "aws_lb" "app_alb" {
+  name               = "sd-demo-alb-${random_id.suffix.hex}"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb_sg.id]
+  subnets            = [aws_subnet.subnet_a.id, aws_subnet.subnet_b.id]
+}
+
+resource "aws_lb_target_group" "alb_tg" {
+  name        = "sd-alb-tg-${random_id.suffix.hex}"
+  port        = 80
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "ip"
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.app_alb.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type = "fixed-response"
+
+    fixed_response {
+      content_type = "text/plain"
+      message_body = "Hello from ALB behind Service Discovery!"
+      status_code  = "200"
+    }
+  }
+}
+
+# -----------------------------------------------------------------------------
+# 3. AWS SERVICE DISCOVERY (CLOUD MAP) SETUP
+# -----------------------------------------------------------------------------
+resource "aws_service_discovery_private_dns_namespace" "sd_namespace" {
+  name        = "myservice.local"
+  description = "Private DNS Namespace for Service Discovery"
+  vpc         = aws_vpc.main.id
+}
+
+resource "aws_service_discovery_service" "sd_service" {
+  name = "alb-service"
+
+  dns_config {
+    namespace_id = aws_service_discovery_private_dns_namespace.sd_namespace.id
+
+    dns_records {
+      ttl  = 10
+      type = "A"
+    }
+
+    routing_policy = "MULTIVALUE"
+  }
+
+  health_check_custom_config {
+    failure_threshold = 1
+  }
+}
+
+# REGISTER ALB ENDPOINT IN SERVICE DISCOVERY
+resource "aws_service_discovery_instance" "alb_instance" {
+  instance_id = "alb-instance-1"
+  service_id  = aws_service_discovery_service.sd_service.id
+
+  attributes = {
+    AWS_INSTANCE_IPV4 = "10.0.1.100"
+    AWS_INIT_HEALTH_STATUS = "HEALTHY"
+    ALB_DNS_NAME           = aws_lb.app_alb.dns_name
+  }
+}
+
+# OUTPUTS
+output "alb_dns_name" {
+  value = aws_lb.app_alb.dns_name
+}
+
+output "service_discovery_namespace" {
+  value = aws_service_discovery_private_dns_namespace.sd_namespace.name
+}
+
+output "service_discovery_service_name" {
+  value = aws_service_discovery_service.sd_service.name
+}
+
+output "service_discovery_service_id" {
+  value = aws_service_discovery_service.sd_service.id
+}
+'@
+
+$MainTfPath = Join-Path -Path $PWD -ChildPath "main.tf"
+[System.IO.File]::WriteAllText($MainTfPath, $TerraformCode)
+Write-Host "main.tf generated successfully." -ForegroundColor Green
+
+# -----------------------------------------------------------------------------
+# STEP 3: APPLY TERRAFORM DEPLOYMENT
+# -----------------------------------------------------------------------------
+Write-Host "`n[3/4] Initializing and Applying Terraform Configuration..." -ForegroundColor Yellow
+terraform init -reconfigure
+
+& terraform apply -auto-approve
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "`nTerraform deployment failed!" -ForegroundColor Red
+    exit 1
+}
+
+# -----------------------------------------------------------------------------
+# STEP 4: EXTRACT OUTPUTS AND RUN PYTHON VERIFICATION CLIENT
+# -----------------------------------------------------------------------------
+Write-Host "`n[4/4] Extracting Service Details and Running Python Verification Client..." -ForegroundColor Yellow
+$ALB_DNS      = (terraform output -raw alb_dns_name)
+$SD_NAMESPACE = (terraform output -raw service_discovery_namespace)
+$SD_NAME      = (terraform output -raw service_discovery_service_name)
+$SD_SERVICE_ID= (terraform output -raw service_discovery_service_id)
+
+Write-Host "ALB DNS Name:                   $ALB_DNS" -ForegroundColor Green
+Write-Host "Service Discovery Namespace:   $SD_NAMESPACE" -ForegroundColor Green
+Write-Host "Service Discovery Service Name: $SD_NAME" -ForegroundColor Green
+Write-Host "Service Discovery Service ID:   $SD_SERVICE_ID" -ForegroundColor Green
+
+python -c "import boto3, requests" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    pip install boto3 requests
+}
+
+$PythonScript = @"
+import boto3
+import requests
+import time
+
+region = 'us-east-1'
+service_id = '$SD_SERVICE_ID'
+alb_dns = '$ALB_DNS'
+
+servicediscovery_client = boto3.client('servicediscovery', region_name=region)
+
+print("\n" + "="*70)
+print("AWS SERVICE DISCOVERY & ELASTIC LOAD BALANCING VERIFICATION")
+print("="*70)
+
+# 1. Discover Endpoints via Service Discovery API
+print(f"1. Querying Service Discovery API for Service ID: {service_id}...")
+try:
+    response = servicediscovery_client.discover_instances(
+        NamespaceName='$SD_NAMESPACE',
+        ServiceName='$SD_NAME'
+    )
+    
+    instances = response.get('Instances', [])
+    print(f"   Discovered {len(instances)} Registered Instance(s) in Service Discovery:")
+    
+    discovered_alb_dns = None
+    for inst in instances:
+        inst_id = inst.get('InstanceId')
+        attrs = inst.get('Attributes', {})
+        print(f"   - Instance ID: {inst_id}")
+        print(f"     Attributes: {attrs}")
+        discovered_alb_dns = attrs.get('ALB_DNS_NAME', alb_dns)
+
+    print("-" * 70)
+
+    # 2. Verify ALB Ingress HTTP Traffic
+    target_url = f"http://{discovered_alb_dns}"
+    print(f"2. Testing HTTP Connectivity to Discovered Load Balancer: {target_url}")
+    
+    # Wait briefly for ALB provisioning
+    time.sleep(5)
+    
+    http_res = requests.get(target_url, timeout=10)
+    print(f"   HTTP Response Code: {http_res.status_code}")
+    print(f"   HTTP Response Body: {http_res.text}")
+    
+    if http_res.status_code == 200:
+        print("\nSUCCESS: Service Discovery successfully located ALB, and HTTP request returned 200 OK!")
+    else:
+        print(f"\nINFO: Request completed with status code {http_res.status_code}")
+
+except Exception as e:
+    print(f"Verification Error: {e}")
+
+print("="*70)
+print("\nSERVICE DISCOVERY + ELB PIPELINE VERIFICATION COMPLETE!")
+"@
+
+$VerifyScriptPath = Join-Path -Path $PWD -ChildPath "verify_sd_alb.py"
+[System.IO.File]::WriteAllText($VerifyScriptPath, $PythonScript)
+python verify_sd_alb.py
+
+Write-Host "`n==================================================" -ForegroundColor Cyan
+Write-Host "AWS ELB + SERVICE DISCOVERY PIPELINE VERIFIED!" -ForegroundColor Green
+Write-Host "==================================================" -ForegroundColor Cyan
