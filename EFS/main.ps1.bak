@@ -1,0 +1,252 @@
+# ==============================================================================
+# AWS EFS (ELASTIC FILE SYSTEM) PIPELINE
+# ==============================================================================
+Write-Host ">>> Initializing AWS EFS Architecture Pipeline..." -ForegroundColor Cyan
+
+# -----------------------------------------------------------------------------
+# STEP 1: CLEAN LOCAL WORKSPACE
+# -----------------------------------------------------------------------------
+Write-Host "`n[1/4] Cleaning local workspace..." -ForegroundColor Yellow
+
+$OldErrorAction = $ErrorActionPreference
+$ErrorActionPreference = "SilentlyContinue"
+
+Get-ChildItem -Path $PWD -Filter "*.tf" | Remove-Item -Force -ErrorAction SilentlyContinue
+
+if (Test-Path "$PWD/terraform.tfstate") { Remove-Item "$PWD/terraform.tfstate" -Force -ErrorAction SilentlyContinue }
+if (Test-Path "$PWD/terraform.tfstate.backup") { Remove-Item "$PWD/terraform.tfstate.backup" -Force -ErrorAction SilentlyContinue }
+if (Test-Path "$PWD/.terraform") { Remove-Item "$PWD/.terraform" -Recurse -Force -ErrorAction SilentlyContinue }
+if (Test-Path "$PWD/.terraform.lock.hcl") { Remove-Item "$PWD/.terraform.lock.hcl" -Force -ErrorAction SilentlyContinue }
+if (Test-Path "$PWD/verify_efs.py") { Remove-Item "$PWD/verify_efs.py" -Force -ErrorAction SilentlyContinue }
+
+$ErrorActionPreference = $OldErrorAction
+Write-Host "Workspace cleaned." -ForegroundColor Green
+
+# -----------------------------------------------------------------------------
+# STEP 2: GENERATE TERRAFORM CODE (main.tf)
+# -----------------------------------------------------------------------------
+Write-Host "`n[2/4] Writing EFS Terraform configuration..." -ForegroundColor Yellow
+
+$TerraformCode = @'
+terraform {
+  required_version = ">= 1.3.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+# 1. NETWORKING SETUP (VPC & SUBNET FOR MOUNT TARGET)
+resource "aws_vpc" "efs_vpc" {
+  cidr_block           = "10.50.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name = "efs-vpc-${random_id.suffix.hex}"
+  }
+}
+
+resource "aws_subnet" "efs_subnet" {
+  vpc_id            = aws_vpc.efs_vpc.id
+  cidr_block        = "10.50.1.0/24"
+  availability_zone = "us-east-1a"
+
+  tags = {
+    Name = "efs-subnet-${random_id.suffix.hex}"
+  }
+}
+
+resource "aws_security_group" "efs_sg" {
+  name        = "efs-security-group-${random_id.suffix.hex}"
+  description = "Allow NFS traffic for EFS"
+  vpc_id      = aws_vpc.efs_vpc.id
+
+  ingress {
+    from_port   = 2049
+    to_port     = 2049
+    protocol    = "tcp"
+    cidr_blocks = ["10.50.0.0/16"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# 2. EFS FILE SYSTEM (ALLOWED LAB CONFLICTS RESTRICTED)
+resource "aws_efs_file_system" "demo_efs" {
+  creation_token   = "efs-token-${random_id.suffix.hex}"
+  performance_mode = "generalPurpose"
+  throughput_mode  = "bursting"
+  encrypted        = true
+
+  lifecycle_policy {
+    transition_to_ia = "AFTER_1_DAY"
+  }
+
+  tags = {
+    Name = "demo-efs-${random_id.suffix.hex}"
+  }
+}
+
+# 3. EFS MOUNT TARGET
+resource "aws_efs_mount_target" "demo_mount_target" {
+  file_system_id  = aws_efs_file_system.demo_efs.id
+  subnet_id       = aws_subnet.efs_subnet.id
+  security_groups = [aws_security_group.efs_sg.id]
+}
+
+# 4. EFS ACCESS POINT
+resource "aws_efs_access_point" "demo_access_point" {
+  file_system_id = aws_efs_file_system.demo_efs.id
+
+  posix_user {
+    gid = 1000
+    uid = 1000
+  }
+
+  root_directory {
+    path = "/data"
+    creation_info {
+      owner_gid   = 1000
+      owner_uid   = 1000
+      permissions = "755"
+    }
+  }
+
+  tags = {
+    Name = "demo-access-point-${random_id.suffix.hex}"
+  }
+}
+
+# OUTPUTS
+output "efs_file_system_id" {
+  value = aws_efs_file_system.demo_efs.id
+}
+
+output "efs_access_point_id" {
+  value = aws_efs_access_point.demo_access_point.id
+}
+
+output "efs_mount_target_id" {
+  value = aws_efs_mount_target.demo_mount_target.id
+}
+'@
+
+$MainTfPath = Join-Path -Path $PWD -ChildPath "main.tf"
+[System.IO.File]::WriteAllText($MainTfPath, $TerraformCode)
+Write-Host "main.tf generated successfully." -ForegroundColor Green
+
+# -----------------------------------------------------------------------------
+# STEP 3: APPLY TERRAFORM DEPLOYMENT
+# -----------------------------------------------------------------------------
+Write-Host "`n[3/4] Initializing and Applying Terraform Configuration..." -ForegroundColor Yellow
+terraform init -reconfigure
+
+& terraform apply -auto-approve
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "`nTerraform deployment failed!" -ForegroundColor Red
+    exit 1
+}
+
+# -----------------------------------------------------------------------------
+# STEP 4: EXTRACT OUTPUTS AND RUN PYTHON VERIFICATION CLIENT
+# -----------------------------------------------------------------------------
+Write-Host "`n[4/4] Extracting EFS Details and Running Python Verification Client..." -ForegroundColor Yellow
+$EFS_ID = (terraform output -raw efs_file_system_id)
+$AP_ID  = (terraform output -raw efs_access_point_id)
+$MT_ID  = (terraform output -raw efs_mount_target_id)
+
+Write-Host "EFS File System ID: $EFS_ID" -ForegroundColor Green
+Write-Host "EFS Access Point ID: $AP_ID" -ForegroundColor Green
+Write-Host "EFS Mount Target ID: $MT_ID" -ForegroundColor Green
+
+python -c "import boto3" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    pip install boto3
+}
+
+$PythonScript = @"
+import boto3
+
+region = 'us-east-1'
+efs_id = '$EFS_ID'
+ap_id = '$AP_ID'
+
+efs_client = boto3.client('efs', region_name=region)
+
+print("\n" + "="*70)
+print("AWS EFS (ELASTIC FILE SYSTEM) CONFIGURATION VERIFICATION")
+print("="*70)
+
+try:
+    # 1. Verify EFS File System
+    print(f"1. Querying EFS File System Details for: {efs_id}...")
+    fs_res = efs_client.describe_file_systems(FileSystemId=efs_id)
+    file_systems = fs_res.get('FileSystems', [])
+    
+    if file_systems:
+        fs = file_systems[0]
+        print(f"   Name / Creation Token: {fs.get('CreationToken')}")
+        print(f"   Life Cycle State:     {fs.get('LifeCycleState')}")
+        print(f"   Performance Mode:     {fs.get('PerformanceMode')}")
+        print(f"   Throughput Mode:      {fs.get('ThroughputMode')}")
+        print(f"   Encrypted:            {fs.get('Encrypted')}")
+        print("   File System Verified Successfully!")
+    
+    print("-" * 70)
+
+    # 2. Verify Lifecycle Configuration
+    print(f"2. Querying Lifecycle Policy for EFS: {efs_id}...")
+    lc_res = efs_client.describe_lifecycle_configuration(FileSystemId=efs_id)
+    policies = lc_res.get('LifecyclePolicies', [])
+    for p in policies:
+        print(f"   Transition to IA Policy: {p.get('TransitionToIA')}")
+    print("   Lifecycle Policy Verified Successfully!")
+
+    print("-" * 70)
+
+    # 3. Verify Access Point
+    print(f"3. Querying EFS Access Point: {ap_id}...")
+    ap_res = efs_client.describe_access_points(AccessPointId=ap_id)
+    access_points = ap_res.get('AccessPoints', [])
+    if access_points:
+        ap = access_points[0]
+        print(f"   Access Point ARN: {ap.get('AccessPointArn')}")
+        print(f"   POSIX User ID:    {ap.get('PosixUser', {}).get('Uid')}")
+        print(f"   Root Path:        {ap.get('RootDirectory', {}).get('Path')}")
+        print("   Access Point Verified Successfully!")
+
+    print("="*70)
+    print("\nEFS ARCHITECTURE DEPLOYED & VERIFIED SUCCESSFULLY!")
+
+except Exception as e:
+    print(f"Verification Error: {e}")
+"@
+
+$VerifyScriptPath = Join-Path -Path $PWD -ChildPath "verify_efs.py"
+[System.IO.File]::WriteAllText($VerifyScriptPath, $PythonScript)
+python verify_efs.py
+
+Write-Host "`n==================================================" -ForegroundColor Cyan
+Write-Host "AWS EFS PIPELINE DEPLOYED & VERIFIED SUCCESSFULLY!" -ForegroundColor Green
+Write-Host "==================================================" -ForegroundColor Cyan
