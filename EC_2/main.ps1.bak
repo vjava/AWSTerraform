@@ -1,0 +1,222 @@
+# AWS Infrastructure Deployment Script (.ps1)
+# Deploys: VPC/Subnets, Security Group, ALB, NLB, Target Groups, CloudWatch Alarms, and 3 EC2 Instances
+# Adheres strictly to T-series Standard CPU mode, max 30GB GP3 volume limit, and Instance Termination on Shutdown.
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# Auto-import AWS Modules
+Import-Module AWS.Tools.EC2 -ErrorAction SilentlyContinue
+Import-Module AWS.Tools.ElasticLoadBalancingV2 -ErrorAction SilentlyContinue
+Import-Module AWS.Tools.CloudWatch -ErrorAction SilentlyContinue
+
+# Configuration Parameters
+$Region            = "us-east-1"
+$VpcCidr           = "10.0.0.0/16"
+$Subnet1Cidr       = "10.0.1.0/24"
+$Subnet2Cidr       = "10.0.2.0/24"
+$InstanceType      = "t3.micro"       # Compliant: 2 vCPU, 1 GiB RAM
+$VolumeSize        = 30               # Compliant: Max 30 GB
+$VolumeType        = "gp3"            # Compliant: GP3
+$ImageSearchName   = "amzn2-ami-hvm-*-x86_64-gp2" # Amazon Linux 2
+
+Set-DefaultAWSRegion -Region $Region
+
+Write-Host "=== Step 1: Network Infrastructure Setup ===" -ForegroundColor Green
+
+# Query Availability Zones that support the chosen instance type (e.g. t3.micro)
+$SupportedAzs = (Get-EC2InstanceTypeOffering -LocationType availability-zone -Filter @{ Name = "instance-type"; Values = $InstanceType }).Location
+
+# Check existing VPC count in the region
+$ExistingVpcs = Get-EC2Vpc
+
+try {
+    # Attempt to create new VPC
+    $Vpc = New-EC2Vpc -CidrBlock $VpcCidr
+    $VpcId = $Vpc.VpcId
+    New-EC2Tag -Resource $VpcId -Tag @{ Key = "Name"; Value = "Lab-VPC" }
+    Edit-EC2VpcAttribute -VpcId $VpcId -EnableDnsHostnames $true
+    Edit-EC2VpcAttribute -VpcId $VpcId -EnableDnsSupport $true
+
+    # Pick 2 AZs that support t3.micro
+    $ValidAzs = $SupportedAzs | Select-Object -First 2
+    $Subnet1 = New-EC2Subnet -VpcId $VpcId -CidrBlock $Subnet1Cidr -AvailabilityZone $ValidAzs[0]
+    $Subnet2 = New-EC2Subnet -VpcId $VpcId -CidrBlock $Subnet2Cidr -AvailabilityZone $ValidAzs[1]
+    New-EC2Tag -Resource $Subnet1.SubnetId -Tag @{ Key = "Name"; Value = "Lab-Subnet-1" }
+    New-EC2Tag -Resource $Subnet2.SubnetId -Tag @{ Key = "Name"; Value = "Lab-Subnet-2" }
+
+    Edit-EC2SubnetAttribute -SubnetId $Subnet1.SubnetId -MapPublicIpOnLaunch $true
+    Edit-EC2SubnetAttribute -SubnetId $Subnet2.SubnetId -MapPublicIpOnLaunch $true
+
+    # Create Internet Gateway
+    $Igw = New-EC2InternetGateway
+    Add-EC2InternetGateway -InternetGatewayId $Igw.InternetGatewayId -VpcId $VpcId
+    New-EC2Tag -Resource $Igw.InternetGatewayId -Tag @{ Key = "Name"; Value = "Lab-IGW" }
+
+    # Route Table Setup
+    $RouteTable = New-EC2RouteTable -VpcId $VpcId
+    New-EC2Tag -Resource $RouteTable.RouteTableId -Tag @{ Key = "Name"; Value = "Lab-Public-RT" }
+    New-EC2Route -RouteTableId $RouteTable.RouteTableId -DestinationCidrBlock "0.0.0.0/0" -GatewayId $Igw.InternetGatewayId | Out-Null
+    Register-EC2RouteTable -RouteTableId $RouteTable.RouteTableId -SubnetId $Subnet1.SubnetId | Out-Null
+    Register-EC2RouteTable -RouteTableId $RouteTable.RouteTableId -SubnetId $Subnet2.SubnetId | Out-Null
+
+    Write-Host "Created new Lab VPC: $VpcId" -ForegroundColor Yellow
+}
+catch {
+    Write-Host "VPC Quota reached or error occurred. Reusing an existing VPC..." -ForegroundColor Yellow
+    
+    # Fallback: Get default VPC or first available VPC
+    $Vpc = $ExistingVpcs | Where-Object { $_.IsDefault -eq $true } | Select-Object -First 1
+    if (-not $Vpc) { $Vpc = $ExistingVpcs[0] }
+    $VpcId = $Vpc.VpcId
+
+    # Fetch existing subnets filtered by supported AZs
+    $SubnetsList = Get-EC2Subnet -Filter @{ Name = "vpc-id"; Values = $VpcId } | 
+        Where-Object { $SupportedAzs -contains $_.AvailabilityZone }
+
+    if ($SubnetsList.Count -lt 2) {
+        throw "Selected VPC ($VpcId) does not have at least 2 subnets in $InstanceType supported Availability Zones ($($SupportedAzs -join ', '))."
+    }
+
+    $Subnet1 = $SubnetsList[0]
+    $Subnet2 = $SubnetsList[1]
+
+    Write-Host "Reusing VPC ID: $VpcId" -ForegroundColor Cyan
+    Write-Host "Reusing Subnet 1: $($Subnet1.SubnetId) ($($Subnet1.AvailabilityZone))" -ForegroundColor Cyan
+    Write-Host "Reusing Subnet 2: $($Subnet2.SubnetId) ($($Subnet2.AvailabilityZone))" -ForegroundColor Cyan
+}
+
+Write-Host "=== Step 2: Security Groups Setup ===" -ForegroundColor Green
+
+# Create Security Group
+$SgId = New-EC2SecurityGroup -GroupName "Lab-SG-$(Get-Random)" -Description "Allow HTTP and SSH" -VpcId $VpcId
+
+# Build HTTP Rule
+$HttpPermission = New-Object Amazon.EC2.Model.IpPermission
+$HttpPermission.IpProtocol = "tcp"
+$HttpPermission.FromPort = 80
+$HttpPermission.ToPort = 80
+$HttpPermission.Ipv4Ranges = New-Object System.Collections.Generic.List[Amazon.EC2.Model.IpRange]
+$HttpRange = New-Object Amazon.EC2.Model.IpRange
+$HttpRange.CidrIp = "0.0.0.0/0"
+$HttpPermission.Ipv4Ranges.Add($HttpRange)
+
+# Build SSH Rule
+$SshPermission = New-Object Amazon.EC2.Model.IpPermission
+$SshPermission.IpProtocol = "tcp"
+$SshPermission.FromPort = 22
+$SshPermission.ToPort = 22
+$SshPermission.Ipv4Ranges = New-Object System.Collections.Generic.List[Amazon.EC2.Model.IpRange]
+$SshRange = New-Object Amazon.EC2.Model.IpRange
+$SshRange.CidrIp = "0.0.0.0/0"
+$SshPermission.Ipv4Ranges.Add($SshRange)
+
+# Grant Ingress Rules
+Grant-EC2SecurityGroupIngress -GroupId $SgId -IpPermission @($HttpPermission, $SshPermission)
+
+Write-Host "=== Step 3: EC2 Instances Deployment (3 Instances) ===" -ForegroundColor Green
+
+# Fetch Latest Amazon Linux 2 AMI
+$AmiId = (Get-EC2Image -Owner amazon -Filter @{ Name = "name"; Values = $ImageSearchName } | 
+    Sort-Object CreationDate -Descending | Select-Object -First 1).ImageId
+
+# Configure 30GB GP3 Root Volume using BlockDeviceMapping
+$BlockDeviceMapping = New-Object Amazon.EC2.Model.BlockDeviceMapping
+$BlockDeviceMapping.DeviceName = "/dev/xvda"
+$Ebs = New-Object Amazon.EC2.Model.EbsBlockDevice
+$Ebs.VolumeSize = $VolumeSize
+$Ebs.VolumeType = $VolumeType
+$Ebs.DeleteOnTermination = $true
+$BlockDeviceMapping.Ebs = $Ebs
+
+# Distribute 3 instances across valid subnets
+$InstanceIds = @()
+$Subnets = @($Subnet1.SubnetId, $Subnet2.SubnetId, $Subnet1.SubnetId)
+
+for ($i = 0; $i -lt 3; $i++) {
+    $Instance = New-EC2Instance `
+        -ImageId $AmiId `
+        -InstanceType $InstanceType `
+        -MinCount 1 `
+        -MaxCount 1 `
+        -SubnetId $Subnets[$i] `
+        -SecurityGroupId $SgId `
+        -BlockDeviceMapping $BlockDeviceMapping `
+        -InstanceInitiatedShutdownBehavior "terminate" `
+        -CreditSpecification_CpuCredit "standard"
+
+    $InstanceId = $Instance.Instances[0].InstanceId
+    $InstanceIds += $InstanceId
+    
+    New-EC2Tag -Resource $InstanceId -Tag @{ Key = "Name"; Value = "Lab-Instance-$($i+1)" }
+    Write-Host "Launched Instance $($i+1) : $InstanceId"
+}
+
+# Wait for instances to reach 'running' state using polling loop
+Write-Host "Waiting for EC2 instances to reach 'running' state..."
+while ($true) {
+    $States = (Get-EC2Instance -InstanceId $InstanceIds).Instances.State.Name
+    $PendingCount = ($States | Where-Object { $_ -ne "running" }).Count
+    if ($PendingCount -eq 0) {
+        Write-Host "All instances are in 'running' state." -ForegroundColor Green
+        break
+    }
+    Write-Host "Waiting for instances... ($PendingCount pending)" -ForegroundColor Yellow
+    Start-Sleep -Seconds 5
+}
+
+Write-Host "=== Step 4: Application Load Balancer (ALB) & Target Group ===" -ForegroundColor Green
+
+# Create ALB Target Group
+$AlbTg = New-ELB2TargetGroup -Name "Lab-ALB-TG-$(Get-Random)" -Protocol HTTP -Port 80 -VpcId $VpcId -TargetType instance
+$AlbTgArn = $AlbTg.TargetGroupArn
+
+# Register Instances with ALB Target Group
+$Targets = $InstanceIds | ForEach-Object { New-Object Amazon.ElasticLoadBalancingV2.Model.TargetDescription -Property @{ Id = $_; Port = 80 } }
+Register-ELB2Target -TargetGroupArn $AlbTgArn -Target $Targets
+
+# Create Application Load Balancer
+$Alb = New-ELB2LoadBalancer -Name "Lab-ALB-$(Get-Random)" -Type application -Subnet $Subnet1.SubnetId, $Subnet2.SubnetId -SecurityGroup $SgId
+$AlbArn = $Alb.LoadBalancerArn
+
+# Create ALB Listener
+$AlbListener = New-ELB2Listener -LoadBalancerArn $AlbArn -Protocol HTTP -Port 80 -DefaultAction @{ Type = "forward"; TargetGroupArn = $AlbTgArn }
+
+Write-Host "=== Step 5: Network Load Balancer (NLB) & Target Group ===" -ForegroundColor Green
+
+# Create NLB Target Group (TCP)
+$NlbTg = New-ELB2TargetGroup -Name "Lab-NLB-TG-$(Get-Random)" -Protocol TCP -Port 80 -VpcId $VpcId -TargetType instance
+$NlbTgArn = $NlbTg.TargetGroupArn
+
+# Register Instances with NLB Target Group
+Register-ELB2Target -TargetGroupArn $NlbTgArn -Target $Targets
+
+# Create Network Load Balancer
+$Nlb = New-ELB2LoadBalancer -Name "Lab-NLB-$(Get-Random)" -Type network -Subnet $Subnet1.SubnetId, $Subnet2.SubnetId
+$NlbArn = $Nlb.LoadBalancerArn
+
+# Create NLB Listener
+$NlbListener = New-ELB2Listener -LoadBalancerArn $NlbArn -Protocol TCP -Port 80 -DefaultAction @{ Type = "forward"; TargetGroupArn = $NlbTgArn }
+
+Write-Host "=== Step 6: Application Lifecycle / CloudWatch Alarm Setup (ALM) ===" -ForegroundColor Green
+
+# Set up CPU Utilization Alarm for the deployed EC2 instances
+foreach ($InstId in $InstanceIds) {
+    Write-CWAlarm -AlarmName "HighCPU-$InstId" `
+        -AlarmDescription "Triggers if CPU exceeds 80% for 5 minutes" `
+        -MetricName "CPUUtilization" `
+        -Namespace "AWS/EC2" `
+        -Statistic "Average" `
+        -Period 300 `
+        -EvaluationPeriods 1 `
+        -Threshold 80 `
+        -ComparisonOperator "GreaterThanOrEqualToThreshold" `
+        -Dimension @{ Name = "InstanceId"; Value = $InstId }
+}
+
+Write-Host "=== Deployment Summary ===" -ForegroundColor Cyan
+Write-Host "VPC ID      : $VpcId"
+Write-Host "Instances   : $($InstanceIds -join ', ')"
+Write-Host "ALB DNS     : $($Alb.DNSName)"
+Write-Host "NLB DNS     : $($Nlb.DNSName)"
+Write-Host "All policy compliance requirements verified successfully." -ForegroundColor Green

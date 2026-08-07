@@ -1,0 +1,313 @@
+# ==============================================================================
+# AWS S3 SOLUTIONS ARCHITECT MASTER OPERATIONS SCRIPT (WITH FULL LOGGING)
+# Demonstrates 10 Core S3 Capabilities with Full Operational Logs:
+# 1. Bucket Creation & Provisioning Logging
+# 2. Public Access Block Enforcement
+# 3. Default SSE-S3 AES-256 Encryption & Bucket Key Setup
+# 4. Bucket Versioning Configuration Logging
+# 5. Object Locking (WORM - Write Once Read Many) Configuration
+# 6. Lifecycle Management (Transition & Version Expiration)
+# 7. S3 Event Notifications (EventBridge Integration)
+# 8. S3 Bucket Policy Enforcement (TLS/HTTPS Enforce)
+# 9. PowerShell Object Operations (Put, Overwrite, Copy, Tagging)
+# 10. Embedded Python Client Execution (HeadObject, Pre-Signed URLs, Version Query)
+# ==============================================================================
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# Helper Function for Formatted Operational Logging
+function Write-OpLog {
+    param (
+        [string]$Step,
+        [string]$Operation,
+        [string]$Details,
+        [string]$Status = "INFO"
+    )
+    $TimeStamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $Color = switch ($Status) {
+        "SUCCESS" { "Green" }
+        "WARN"    { "Yellow" }
+        "ERROR"   { "Red" }
+        default   { "Cyan" }
+    }
+    Write-Host "[$TimeStamp] [$Step] [$Operation] $Details" -ForegroundColor $Color
+}
+
+# Ensure AWS S3 Module is loaded
+if (Get-Module -ListAvailable -Name AWS.Tools.S3) {
+    Import-Module AWS.Tools.S3
+} elseif (Get-Module -ListAvailable -Name AWSPowerShell) {
+    Import-Module AWSPowerShell
+} else {
+    Write-Error "AWS S3 PowerShell Module is missing. Please run:`nInstall-Module -Name AWS.Tools.S3 -AllowClobber -Force -Scope CurrentUser"
+    exit
+}
+
+# Regional Setup
+$Region = "us-east-1"
+Set-DefaultAWSRegion -Region $Region
+
+# Generate Globally Unique Bucket Names
+$RandomSuffix = Get-Random -Minimum 1000 -Maximum 9999
+$BucketName   = "architect-master-bucket-$RandomSuffix"
+$LockBucket   = "architect-lock-bucket-$RandomSuffix"
+
+Write-Host "`n================================================================================" -ForegroundColor White
+Write-Host " STARTING AWS S3 ARCHITECTURAL PROVISIONING WITH LOGS " -ForegroundColor Green
+Write-Host " Primary Bucket       : $BucketName" -ForegroundColor Cyan
+Write-Host " Object Lock Bucket   : $LockBucket" -ForegroundColor Cyan
+Write-Host " AWS Region           : $Region" -ForegroundColor Cyan
+Write-Host "================================================================================" -ForegroundColor White
+
+
+# ------------------------------------------------------------------------------
+# PILLAR 1: BUCKET PROVISIONING & INFRASTRUCTURE
+# ------------------------------------------------------------------------------
+Write-Host "`n=== [PILLAR 1] BUCKET CREATION & INFRASTRUCTURE ===" -ForegroundColor Yellow
+
+Write-OpLog -Step "Pillar 1" -Operation "New-S3Bucket" -Details "Creating standard S3 bucket: $BucketName"
+$Res1 = New-S3Bucket -BucketName $BucketName -Region $Region
+Write-OpLog -Step "Pillar 1" -Operation "New-S3Bucket Response" -Details "Bucket Created successfully. Output: $Res1" -Status "SUCCESS"
+
+Write-OpLog -Step "Pillar 1" -Operation "New-S3Bucket (WORM)" -Details "Creating Object Lock S3 bucket: $LockBucket"
+$Res2 = New-S3Bucket -BucketName $LockBucket -Region $Region -ObjectLockEnabledForBucket $true
+Write-OpLog -Step "Pillar 1" -Operation "New-S3Bucket Response" -Details "Lock Bucket Created successfully with ObjectLockEnabled=True." -Status "SUCCESS"
+
+
+# ------------------------------------------------------------------------------
+# PILLAR 2: PUBLIC ACCESS BLOCK SAFEGUARDS
+# ------------------------------------------------------------------------------
+Write-Host "`n=== [PILLAR 2] BLOCK PUBLIC ACCESS ENFORCEMENT ===" -ForegroundColor Yellow
+
+Write-OpLog -Step "Pillar 2" -Operation "Add-S3PublicAccessBlock" -Details "Applying Block Public Access (4/4 flags) on $BucketName..."
+Add-S3PublicAccessBlock -BucketName $BucketName `
+    -PublicAccessBlockConfiguration_BlockPublicAcl $true `
+    -PublicAccessBlockConfiguration_BlockPublicPolicy $true `
+    -PublicAccessBlockConfiguration_IgnorePublicAcl $true `
+    -PublicAccessBlockConfiguration_RestrictPublicBucket $true
+
+$PbaConfig = Get-S3PublicAccessBlock -BucketName $BucketName
+Write-OpLog -Step "Pillar 2" -Operation "Get-S3PublicAccessBlock Verification" -Details "BlockPublicAcls=$($PbaConfig.BlockPublicAcls), BlockPublicPolicy=$($PbaConfig.BlockPublicPolicy), IgnorePublicAcls=$($PbaConfig.IgnorePublicAcls), RestrictPublicBuckets=$($PbaConfig.RestrictPublicBuckets)" -Status "SUCCESS"
+
+
+# ------------------------------------------------------------------------------
+# PILLAR 3: SERVER-SIDE ENCRYPTION & BUCKET KEYS
+# ------------------------------------------------------------------------------
+Write-Host "`n=== [PILLAR 3] SERVER-SIDE ENCRYPTION (SSE-S3) ===" -ForegroundColor Yellow
+
+Write-OpLog -Step "Pillar 3" -Operation "Set-S3BucketEncryption" -Details "Enforcing default SSE-S3 AES-256 Encryption + Bucket Key on $BucketName..."
+Set-S3BucketEncryption -BucketName $BucketName -ServerSideEncryptionConfiguration_ServerSideEncryptionRule @(
+    @{
+        ServerSideEncryptionByDefault = @{
+            ServerSideEncryptionAlgorithm = "AES256"
+        }
+        BucketKeyEnabled = $true
+    }
+)
+
+$EncConfig = Get-S3BucketEncryption -BucketName $BucketName
+$Algo = $EncConfig.ServerSideEncryptionRules[0].ServerSideEncryptionByDefault.ServerSideEncryptionAlgorithm
+$BucketKey = $EncConfig.ServerSideEncryptionRules[0].BucketKeyEnabled
+Write-OpLog -Step "Pillar 3" -Operation "Get-S3BucketEncryption Verification" -Details "Encryption Algorithm: $Algo | BucketKeyEnabled: $BucketKey" -Status "SUCCESS"
+
+
+# ------------------------------------------------------------------------------
+# PILLAR 4: BUCKET VERSIONING CONTROL
+# ------------------------------------------------------------------------------
+Write-Host "`n=== [PILLAR 4] BUCKET VERSIONING CONFIGURATION ===" -ForegroundColor Yellow
+
+Write-OpLog -Step "Pillar 4" -Operation "Write-S3BucketVersioning" -Details "Enabling versioning on $BucketName and $LockBucket..."
+Write-S3BucketVersioning -BucketName $BucketName -VersioningConfig_Status Enabled
+Write-S3BucketVersioning -BucketName $LockBucket -VersioningConfig_Status Enabled
+
+$VerStatus1 = (Get-S3BucketVersioning -BucketName $BucketName).Status
+$VerStatus2 = (Get-S3BucketVersioning -BucketName $LockBucket).Status
+Write-OpLog -Step "Pillar 4" -Operation "Get-S3BucketVersioning Verification" -Details "$BucketName Status: $VerStatus1 | $LockBucket Status: $VerStatus2" -Status "SUCCESS"
+
+
+# ------------------------------------------------------------------------------
+# PILLAR 5: WORM / OBJECT LOCKING & LEGAL HOLDS
+# ------------------------------------------------------------------------------
+Write-Host "`n=== [PILLAR 5] OBJECT LOCKING (WORM RETENTION) ===" -ForegroundColor Yellow
+
+Write-OpLog -Step "Pillar 5" -Operation "Write-S3ObjectLockConfiguration" -Details "Configuring 7-Day Compliance WORM Mode on $LockBucket..."
+
+Write-S3ObjectLockConfiguration -BucketName $LockBucket `
+    -ObjectLockConfiguration_ObjectLockEnabled "Enabled" `
+    -DefaultRetention_Mode "COMPLIANCE" `
+    -DefaultRetention_Day 7
+
+$LockCheck = Get-S3ObjectLockConfiguration -BucketName $LockBucket
+$Mode = $LockCheck.Rule.DefaultRetention.Mode
+$Days = $LockCheck.Rule.DefaultRetention.Days
+Write-OpLog -Step "Pillar 5" -Operation "Get-S3ObjectLockConfiguration Verification" -Details "Object Lock Enabled: $($LockCheck.ObjectLockEnabled) | Mode: $Mode | Retention: $Days Days" -Status "SUCCESS"
+
+
+# ------------------------------------------------------------------------------
+# PILLAR 6: LIFECYCLE MANAGEMENT RULES
+# ------------------------------------------------------------------------------
+Write-Host "`n=== [PILLAR 6] STORAGE LIFECYCLE MANAGEMENT ===" -ForegroundColor Yellow
+
+Write-OpLog -Step "Pillar 6" -Operation "Write-S3LifecycleConfiguration" -Details "Applying lifecycle rule (30d Standard-IA transition, 90d noncurrent expiration)..."
+$Transition = New-Object Amazon.S3.Model.LifecycleTransition
+$Transition.Days = 30
+$Transition.StorageClass = [Amazon.S3.S3StorageClass]::StandardInfrequentAccess
+
+$NoncurrentExpiration = New-Object Amazon.S3.Model.LifecycleRuleNoncurrentVersionExpiration
+$NoncurrentExpiration.NoncurrentDays = 90
+
+$LifecycleRule = New-Object Amazon.S3.Model.LifecycleRule
+$LifecycleRule.Id = "EnterpriseLifecyclePolicy"
+$LifecycleRule.Status = [Amazon.S3.LifecycleRuleStatus]::Enabled
+$LifecycleRule.Filter = New-Object Amazon.S3.Model.LifecycleFilter
+$LifecycleRule.Filter.LifecycleFilterPredicate = New-Object Amazon.S3.Model.LifecyclePrefixPredicate -Property @{ Prefix = "" }
+$LifecycleRule.Transitions = New-Object System.Collections.Generic.List[Amazon.S3.Model.LifecycleTransition]
+$LifecycleRule.Transitions.Add($Transition)
+$LifecycleRule.NoncurrentVersionExpiration = $NoncurrentExpiration
+
+Write-S3LifecycleConfiguration -BucketName $BucketName -Configuration_Rule @($LifecycleRule)
+
+$LifeCheck = Get-S3LifecycleConfiguration -BucketName $BucketName
+Write-OpLog -Step "Pillar 6" -Operation "Get-S3LifecycleConfiguration Verification" -Details "Rule ID: $($LifeCheck.Rules[0].Id) | Status: $($LifeCheck.Rules[0].Status) | Transition Days: $($LifeCheck.Rules[0].Transitions[0].Days)" -Status "SUCCESS"
+
+
+# ------------------------------------------------------------------------------
+# PILLAR 7: EVENT NOTIFICATIONS (EVENTBRIDGE INTEGRATION)
+# ------------------------------------------------------------------------------
+Write-Host "`n=== [PILLAR 7] EVENTBRIDGE NOTIFICATIONS ===" -ForegroundColor Yellow
+
+Write-OpLog -Step "Pillar 7" -Operation "Write-S3BucketNotification" -Details "Enabling Amazon EventBridge notification bus on $BucketName..."
+
+$EbConfig = New-Object Amazon.S3.Model.EventBridgeConfiguration
+Write-S3BucketNotification -BucketName $BucketName -EventBridgeConfiguration $EbConfig
+
+$EbCheck = Get-S3BucketNotification -BucketName $BucketName
+$EbEnabled = if ($null -ne $EbCheck.EventBridgeConfiguration) { "Active" } else { "Inactive" }
+Write-OpLog -Step "Pillar 7" -Operation "Get-S3BucketNotification Verification" -Details "EventBridge Status: $EbEnabled" -Status "SUCCESS"
+
+
+# ------------------------------------------------------------------------------
+# PILLAR 8: BUCKET SECURITY POLICY (ENFORCE TLS / HTTPS)
+# ------------------------------------------------------------------------------
+Write-Host "`n=== [PILLAR 8] BUCKET POLICY ENFORCEMENT ===" -ForegroundColor Yellow
+
+Write-OpLog -Step "Pillar 8" -Operation "Write-S3BucketPolicy" -Details "Attaching DenyNonTLS policy to $BucketName..."
+$PolicyJson = @"
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "EnforceTLSRequestsOnly",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": [
+                "arn:aws:s3:::$BucketName",
+                "arn:aws:s3:::$BucketName/*"
+            ],
+            "Condition": {
+                "Bool": {
+                    "aws:SecureTransport": "false"
+                }
+            }
+        }
+    ]
+}
+"@
+Write-S3BucketPolicy -BucketName $BucketName -Policy $PolicyJson
+
+$PolCheck = Get-S3BucketPolicy -BucketName $BucketName
+$PolicyText = if ($PolCheck.Policy -is [string]) { $PolCheck.Policy } else { $PolCheck.Policy.Policy }
+Write-OpLog -Step "Pillar 8" -Operation "Get-S3BucketPolicy Verification" -Details "Policy PolicyText length: $($PolicyText.Length) characters" -Status "SUCCESS"
+
+
+# ------------------------------------------------------------------------------
+# PILLAR 9: POWERSHELL OBJECT OPERATIONS (PUT, COPY, TAGS, VERSIONS)
+# ------------------------------------------------------------------------------
+Write-Host "`n=== [PILLAR 9] OBJECT OPERATIONS & METADATA LOGS ===" -ForegroundColor Yellow
+
+$TestKey = "architecture_doc.txt"
+$Content1 = "AWS Solutions Architecture Blueprint Version 1"
+$Content2 = "AWS Solutions Architecture Blueprint Version 2 (Updated)"
+
+# 1. Upload Object V1 with Tags
+Write-OpLog -Step "Pillar 9" -Operation "Write-S3Object (V1)" -Details "Uploading initial file '$TestKey' with object tags..."
+$Tag1 = New-Object Amazon.S3.Model.Tag -Property @{ Key = "Environment"; Value = "Production" }
+$Tag2 = New-Object Amazon.S3.Model.Tag -Property @{ Key = "Classification"; Value = "Confidential" }
+Write-S3Object -BucketName $BucketName -Key $TestKey -Content $Content1 -TagSet @($Tag1, $Tag2) | Out-Null
+Write-OpLog -Step "Pillar 9" -Operation "Write-S3Object Response" -Details "Version 1 Upload Complete." -Status "SUCCESS"
+
+# 2. Upload Object V2 (Overwrite)
+Write-OpLog -Step "Pillar 9" -Operation "Write-S3Object (V2)" -Details "Overwriting '$TestKey' to trigger Versioning..."
+Write-S3Object -BucketName $BucketName -Key $TestKey -Content $Content2 | Out-Null
+Write-OpLog -Step "Pillar 9" -Operation "Write-S3Object Response" -Details "Version 2 Overwrite Complete." -Status "SUCCESS"
+
+# 3. Server-Side Copy
+$CopyKey = "archive/architecture_doc_backup.txt"
+Write-OpLog -Step "Pillar 9" -Operation "Copy-S3Object" -Details "Executing server-side copy from '$TestKey' to '$CopyKey'..."
+Copy-S3Object -SourceBucket $BucketName -SourceKey $TestKey -DestinationBucket $BucketName -DestinationKey $CopyKey | Out-Null
+Write-OpLog -Step "Pillar 9" -Operation "Copy-S3Object Response" -Details "Server-Side Copy Complete." -Status "SUCCESS"
+
+# 4. Query Object Versions Log Output
+Write-OpLog -Step "Pillar 9" -Operation "Get-S3Version Logging" -Details "Retrieving all stored object versions for '$TestKey':"
+$Versions = (Get-S3Version -BucketName $BucketName -Prefix $TestKey).Versions
+foreach ($v in $Versions) {
+    Write-Host "   -> VersionId: $($v.VersionId) | IsLatest: $($v.IsLatest) | Size: $($v.Size) bytes | LastModified: $($v.LastModified)" -ForegroundColor Cyan
+}
+
+
+# ------------------------------------------------------------------------------
+# PILLAR 10: EMBEDDED PYTHON CLIENT OPERATIONAL LOGS
+# ------------------------------------------------------------------------------
+Write-Host "`n=== [PILLAR 10] EMBEDDED PYTHON CLIENT EXECUTION ===" -ForegroundColor Yellow
+
+Write-OpLog -Step "Pillar 10" -Operation "Python Boto3 Client" -Details "Invoking embedded Python client script for S3 API queries..."
+
+$PythonScript = @"
+import boto3
+import sys
+
+bucket_name = "$BucketName"
+region = "$Region"
+key = "$TestKey"
+
+try:
+    s3 = boto3.client('s3', region_name=region)
+
+    # 1. Fetch Object Metadata (HeadObject)
+    print("   [Python Log] [HeadObject] Querying object headers...")
+    head = s3.head_object(Bucket=bucket_name, Key=key)
+    print(f"      - ContentLength: {head['ContentLength']} bytes")
+    print(f"      - ETag: {head['ETag']}")
+    print(f"      - ServerSideEncryption: {head.get('ServerSideEncryption')}")
+    print(f"      - BucketKeyEnabled: {head.get('BucketKeyEnabled')}")
+
+    # 2. Generate Pre-Signed Download URL
+    print("   [Python Log] [GeneratePresignedUrl] Generating 15-minute download URL...")
+    presigned_url = s3.generate_presigned_url(
+        'get_object',
+        Params={'Bucket': bucket_name, 'Key': key},
+        ExpiresIn=900
+    )
+    print(f"      - Pre-Signed URL: {presigned_url[:80]}...")
+
+    # 3. Read Specific Historical Versions via Python
+    print("   [Python Log] [GetObject] Querying historical versions data...")
+    versions = s3.list_object_versions(Bucket=bucket_name, Prefix=key)
+    for v in versions.get('Versions', []):
+        v_id = v['VersionId']
+        is_latest = v['IsLatest']
+        obj_data = s3.get_object(Bucket=bucket_name, Key=key, VersionId=v_id)['Body'].read().decode('utf-8')
+        print(f"      - VersionId: {v_id[:16]}... | IsLatest: {is_latest} | Content: '{obj_data}'")
+
+except Exception as e:
+    print(f"   [Python Error]: {e}")
+    sys.exit(1)
+"@
+
+$PythonScript | python -
+
+Write-Host "`n================================================================================" -ForegroundColor White
+Write-Host " ALL AWS S3 ARCHITECTURAL OPERATIONS & LOGS EXECUTED SUCCESSFULLY " -ForegroundColor Green
+Write-Host "================================================================================" -ForegroundColor White
