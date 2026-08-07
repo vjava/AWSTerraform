@@ -1,0 +1,125 @@
+import psycopg2
+from psycopg2.extras import execute_values
+import random
+import time
+import uuid
+
+# -----------------------------------------------------------------------------
+# 1. DATABASE CONFIGURATION
+# -----------------------------------------------------------------------------
+# अपने Aurora PostgreSQL क्लस्टर या RDS एंडपॉइंट के साथ बदलें
+DB_HOST = "compliant-aurora-pg-inst.xxx.us-east-1.rds.amazonaws.com"
+DB_NAME = "transaction_db"
+DB_USER = "postgres"
+DB_PASS = "LabPassword123!"  # आपका पासवर्ड
+DB_PORT = 5432
+
+print(f"Connecting to Aurora PostgreSQL Database at {DB_HOST}...")
+
+# -----------------------------------------------------------------------------
+# 2. CONNECT TO DATABASE (WITH RETRY LOOP)
+# -----------------------------------------------------------------------------
+connected = False
+conn = None
+
+for attempt in range(1, 11):
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASS,
+            port=DB_PORT,
+            connect_timeout=10
+        )
+        connected = True
+        print("Successfully connected to Aurora PostgreSQL!")
+        break
+    except Exception as e:
+        print(f"Connection attempt {attempt}/10 failed: {e}")
+        time.sleep(5)
+
+if not connected or conn is None:
+    print("Error: Could not establish database connection.")
+    exit(1)
+
+cursor = conn.cursor()
+
+try:
+    # -----------------------------------------------------------------------------
+    # 3. CREATE TABLE
+    # -----------------------------------------------------------------------------
+    create_table_query = """
+    CREATE TABLE IF NOT EXISTS transactions (
+        transaction_id SERIAL PRIMARY KEY,
+        reference_code VARCHAR(64) UNIQUE NOT NULL,
+        account_number VARCHAR(20) NOT NULL,
+        transaction_type VARCHAR(20) NOT NULL,
+        amount NUMERIC(12, 2) NOT NULL,
+        status VARCHAR(20) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+    cursor.execute(create_table_query)
+    conn.commit()
+    print("Table 'transactions' verified/created successfully.")
+
+    # -----------------------------------------------------------------------------
+    # 4. GENERATE MOCK DATA (1000 RECORDS)
+    # -----------------------------------------------------------------------------
+    txn_types = ['CREDIT', 'DEBIT', 'TRANSFER', 'REFUND', 'PAYMENT']
+    statuses = ['COMPLETED', 'PENDING', 'FAILED', 'PROCESSING']
+
+    records = []
+    print("Generating 1,000 transaction records...")
+    for i in range(1, 1001):
+        ref_code = f"PGTXN-{uuid.uuid4().hex[:12].upper()}"
+        acc_num = f"ACC{random.randint(10000000, 99999999)}"
+        t_type = random.choice(txn_types)
+        amount = round(random.uniform(5.00, 15000.00), 2)
+        status = random.choice(statuses)
+        records.append((ref_code, acc_num, t_type, amount, status))
+
+    # -----------------------------------------------------------------------------
+    # 5. HIGH-PERFORMANCE BATCH INSERTION
+    # -----------------------------------------------------------------------------
+    insert_query = """
+    INSERT INTO transactions (reference_code, account_number, transaction_type, amount, status)
+    VALUES %s;
+    """
+    
+    start_time = time.time()
+    execute_values(cursor, insert_query, records)
+    conn.commit()
+    end_time = time.time()
+
+    print(f"Successfully inserted 1,000 records in {round(end_time - start_time, 2)} seconds!")
+
+    # -----------------------------------------------------------------------------
+    # 6. VERIFY INSERTED DATA
+    # -----------------------------------------------------------------------------
+    cursor.execute("SELECT COUNT(*) FROM transactions;")
+    total_count = cursor.fetchone()[0]
+    print(f"Verification: Total records in 'transactions' table = {total_count}")
+
+    # Summary View
+    cursor.execute("""
+        SELECT transaction_type, COUNT(*), SUM(amount) 
+        FROM transactions 
+        GROUP BY transaction_type;
+    """)
+    print("\nSummary Grouped by Transaction Type:")
+    print("-" * 60)
+    for row in cursor.fetchall():
+        print(f"Type: {row[0]:<10} | Count: {row[1]:<5} | Total Amount: ${row[2]:,.2f}")
+    print("-" * 60)
+
+except Exception as e:
+    print(f"An error occurred during database operation: {e}")
+    conn.rollback()
+
+finally:
+    # Close connections
+    cursor.close()
+    conn.close()
+    print("Database connection closed.")
