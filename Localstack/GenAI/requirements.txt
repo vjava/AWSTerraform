@@ -1,0 +1,7 @@
+mcp
+databricks-sql-connector
+pandas
+python-dotenv
+streamlit
+requests
+databricks-sdk

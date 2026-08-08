@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AWS Transcribe Service Dashboard</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f6; margin: 0; padding: 20px; }
+        .container { max-width: 1100px; margin: 0 auto; background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; border-bottom: 2px solid #8e44ad; padding-bottom: 10px; }
+        .btn { background-color: #8e44ad; color: white; border: none; padding: 10px 20px; font-size: 16px; border-radius: 5px; cursor: pointer; margin-right: 10px; }
+        .btn:hover { background-color: #71368a; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #ddd; }
+        th { background-color: #8e44ad; color: white; }
+        tr:hover { background-color: #f1f1f1; }
+        .status-success { color: #27ae60; font-weight: bold; }
+        .badge { background: #8e44ad; color: white; padding: 4px 8px; border-radius: 4px; font-size: 13px; }
+        .transcript-box { background: #f9f9f9; padding: 10px; border-left: 4px solid #8e44ad; font-style: italic; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Amazon Transcribe Results Dashboard</h1>
+        <div>
+            <button class="btn" onclick="fetchTranscriptions()">Refresh Transcriptions</button>
+            <span id="record-count" class="badge">0 Transcripts</span>
+        </div>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Source Audio File</th>
+                    <th>Transcription Output Text</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody id="transcribe-table-body">
+                <tr><td colspan="3">Click 'Refresh Transcriptions' to load converted speech text...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        const TRANSCRIBE_API = "http://localhost:4566/restapis/l7iv4zhvva/prod/_user_request_/transcriptions";
+
+        async function fetchTranscriptions() {
+            const tableBody = document.getElementById("transcribe-table-body");
+            tableBody.innerHTML = "<tr><td colspan='3'>Fetching transcription outputs...</td></tr>";
+
+            try {
+                const response = await fetch(TRANSCRIBE_API);
+                const items = await response.json();
+
+                if (!Array.isArray(items) || items.length === 0) {
+                    document.getElementById("record-count").innerText = "0 Transcripts";
+                    tableBody.innerHTML = "<tr><td colspan='3'>No transcription files found. Run client script to process audio.</td></tr>";
+                    return;
+                }
+
+                document.getElementById("record-count").innerText = `${items.length} Audio File(s) Processed`;
+                tableBody.innerHTML = "";
+                
+                items.forEach(item => {
+                    const row = document.createElement("tr");
+                    const fileName = item.source_file || "audio_sample.mp3";
+                    const text = item.results?.transcripts[0]?.transcript || "N/A";
+                    row.innerHTML = `
+                        <td><code>${fileName}</code></td>
+                        <td><div class="transcript-box">"${text}"</div></td>
+                        <td class="status-success">${item.status || 'COMPLETED'}</td>
+                    `;
+                    tableBody.appendChild(row);
+                });
+            } catch (error) {
+                tableBody.innerHTML = `<tr><td colspan='3' style='color:red;'>Error fetching data: ${error.message}</td></tr>`;
+            }
+        }
+    </script>
+</body>
+</html>

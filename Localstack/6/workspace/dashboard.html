@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Transaction Ingestion Dashboard</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f6; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+        .btn { background-color: #3498db; color: white; border: none; padding: 10px 20px; font-size: 16px; border-radius: 5px; cursor: pointer; margin-right: 10px; }
+        .btn:hover { background-color: #2980b9; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #ddd; }
+        th { background-color: #3498db; color: white; }
+        .th-dlq { background-color: #e74c3c; }
+        tr:hover { background-color: #f1f1f1; }
+        .status-success { color: #27ae60; font-weight: bold; }
+        .status-rejected { color: #c0392b; font-weight: bold; }
+        .badge { background: #27ae60; color: white; padding: 4px 8px; border-radius: 4px; font-size: 13px; margin-right: 10px; }
+        .badge-dlq { background: #e74c3c; }
+        .section-title { margin-top: 30px; font-size: 20px; color: #34495e; border-bottom: 1px solid #ccc; padding-bottom: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>AWS LocalStack Pipeline Dashboard</h1>
+        <div>
+            <button class="btn" onclick="fetchAllData()">Refresh All Records</button>
+            <span id="valid-count" class="badge">0 Valid Records (DynamoDB)</span>
+            <span id="dlq-count" class="badge badge-dlq">0 DLQ Rejected Records (SQS)</span>
+        </div>
+
+        <div class="section-title">Valid Records (Ingested to DynamoDB via GET /transactions)</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Transaction ID</th>
+                    <th>User ID</th>
+                    <th>Amount ($)</th>
+                    <th>Timestamp</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody id="valid-table-body">
+                <tr><td colspan="5">Click 'Refresh All Records' to load...</td></tr>
+            </tbody>
+        </table>
+
+        <div class="section-title">Rejected Records (Captured in DLQ via GET /dlq)</div>
+        <table>
+            <thead>
+                <tr>
+                    <th class="th-dlq">Rejection Reason</th>
+                    <th class="th-dlq">Transaction ID</th>
+                    <th class="th-dlq">User ID</th>
+                    <th class="th-dlq">Raw Amount</th>
+                    <th class="th-dlq">Source File</th>
+                </tr>
+            </thead>
+            <tbody id="dlq-table-body">
+                <tr><td colspan="5">Click 'Refresh All Records' to load...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        const TRANSACTIONS_API = "http://localhost:4566/restapis/wenpggjttr/prod/_user_request_/transactions";
+        const DLQ_API = "http://localhost:4566/restapis/wenpggjttr/prod/_user_request_/dlq";
+
+        async function fetchAllData() {
+            fetchValidTransactions();
+            fetchDLQRecords();
+        }
+
+        async function fetchValidTransactions() {
+            const tableBody = document.getElementById("valid-table-body");
+            tableBody.innerHTML = "<tr><td colspan='5'>Loading DynamoDB records...</td></tr>";
+
+            try {
+                const response = await fetch(TRANSACTIONS_API);
+                const data = await response.json();
+                const items = data.Items || [];
+                document.getElementById("valid-count").innerText = `${items.length} Valid Records (DynamoDB)`;
+
+                if (items.length === 0) {
+                    tableBody.innerHTML = "<tr><td colspan='5'>No valid records found in DynamoDB.</td></tr>";
+                    return;
+                }
+
+                tableBody.innerHTML = "";
+                items.forEach(item => {
+                    const row = document.createElement("tr");
+                    row.innerHTML = `
+                        <td><code>${item.transaction_id.S}</code></td>
+                        <td>${item.user_id.S}</td>
+                        <td><strong>$${item.amount.S}</strong></td>
+                        <td>${item.timestamp.S}</td>
+                        <td class="status-success">${item.status.S}</td>
+                    `;
+                    tableBody.appendChild(row);
+                });
+            } catch (error) {
+                tableBody.innerHTML = `<tr><td colspan='5' style='color:red;'>Error: ${error.message}</td></tr>`;
+            }
+        }
+
+        async function fetchDLQRecords() {
+            const tableBody = document.getElementById("dlq-table-body");
+            tableBody.innerHTML = "<tr><td colspan='5'>Loading DLQ rejected messages...</td></tr>";
+
+            try {
+                const response = await fetch(DLQ_API);
+                const data = await response.json();
+                const messages = data.ReceiveMessageResponse?.ReceiveMessageResult?.Message || [];
+                const msgList = Array.isArray(messages) ? messages : [messages];
+                
+                if (msgList.length === 0 || !messages) {
+                    document.getElementById("dlq-count").innerText = "0 DLQ Rejected Records (SQS)";
+                    tableBody.innerHTML = "<tr><td colspan='5'>No rejected records in DLQ.</td></tr>";
+                    return;
+                }
+
+                document.getElementById("dlq-count").innerText = `${msgList.length} DLQ Rejected Records (SQS)`;
+                tableBody.innerHTML = "";
+                msgList.forEach(msg => {
+                    const body = JSON.parse(msg.Body);
+                    const rec = body.failed_record || {};
+                    const row = document.createElement("tr");
+                    row.innerHTML = `
+                        <td class="status-rejected">${body.rejection_reason || 'Validation Failed'}</td>
+                        <td><code>${rec.transaction_id || 'N/A (Missing)'}</code></td>
+                        <td>${rec.user_id || 'N/A (Missing)'}</td>
+                        <td><strong>${rec.amount || 'N/A'}</strong></td>
+                        <td>${body.source_file || 'transactions.csv'}</td>
+                    `;
+                    tableBody.appendChild(row);
+                });
+            } catch (error) {
+                tableBody.innerHTML = `<tr><td colspan='5' style='color:red;'>Error fetching DLQ: ${error.message}</td></tr>`;
+            }
+        }
+    </script>
+</body>
+</html>
